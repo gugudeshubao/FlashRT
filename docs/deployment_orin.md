@@ -155,6 +155,98 @@ validated on real robot tasks.
 Orin memory bandwidth is ~204 GB/s (LPDDR5X, same as ThorU).
 Encoder GEMMs are **compute-bound** (16 SM limit), not bandwidth-bound.
 
+## GPU Profiling (nsys + ncu)
+
+### nsys: Kernel-Level Time Breakdown (pool=1, 2-cam, 10-step, 3 inferences)
+
+Total GPU time: 140.8 ms/inference.
+
+| Kernel | calls/inf | time/inf | % | Notes |
+|---|---|---|---|---|
+| **Kernel2** (CUTLASS INT8 GEMMs) | 908 | **86.8 ms** | **61.7%** | All encoder/decoder/vision INT8 GEMMs |
+| gate_silu_mul_merged_kernel | 197 | 9.6 ms | 6.8% | SiLU-gated activation |
+| quantize_int8_rowwise_kernel | 394 | 9.2 ms | 6.5% | Dynamic per-row quantize (enc attn_O + dec) |
+| add_bias_bf16_kernel | 55 | 6.0 ms | 4.3% | Vision bias adds (27L × QKV+up) |
+| quantize_int8_kernel_generic | 108 | 4.7 ms | 3.4% | Static vision INT8 quantize |
+| flash_fwd_splitkv_kernel + flash_fwd | 224 | 4.4 ms | 3.1% | FA2 attention (vis+enc+dec) |
+| residual_add_rms_norm_int8_rowwise | 17 | 1.5 ms | 1.0% | Fused enc FFN norm |
+| rms_norm_int8_rowwise | 18 | 0.7 ms | 0.5% | Fused enc QKV norm |
+| Other norms / residuals / misc | — | 7.9 ms | 5.6% | — |
+
+GEMM duration distribution (per inference):
+- < 50 μs: 568 calls → 15.7 ms (tiny decoder GEMMs, M=10)
+- 50–150 μs: 274 calls → 20.6 ms (vision + small encoder GEMMs)
+- 150–500 μs: 32 calls → 6.4 ms (medium encoder GEMMs)
+- 500–1500 μs: 30 calls → 34.9 ms (large encoder gate_up/down)
+- > 1500 μs: 4 calls → 9.3 ms (largest encoder GEMMs)
+
+### ncu: GPU Utilization Per GEMM Shape
+
+Profiled with Nsight Compute 2024.3.1 on Orin SM87 (CC 8.7).
+
+| GEMM | M | N | K | compute_mem % | sm_throughput % | IMMA active % |
+|---|---|---|---|---|---|---|
+| Encoder gate_up | 560 | 32768 | 2048 | **92.3%** | 79.7% | **80.1%** |
+| Decoder gate_up | 10 | 8192 | 1024 | 73.1% | 54.2% | — |
+
+**Encoder gate_up at 92% GPU throughput** — this is the dominant GEMM
+and it is already running at 92% of peak hardware capability.
+INT8 tensor cores (IMMA) are active 80% of the time during this kernel.
+
+**Decoder gate_up at 73% / 54%** — M=10 is tiny relative to the
+128×128×64 CUTLASS tile; 1280 tiles but with only 1 M-tile means
+significant underutilization per SM. This is a fundamental hardware
+constraint for small-batch decoding.
+
+**Interpretation:** The INT8 CUTLASS GEMM on SM87 is already near its
+hardware ceiling for the large encoder GEMMs. Further optimization of
+these kernels via different tile shapes or scheduling would yield at
+most ~8% improvement. The gap to ThorU is a **hardware gap** (more SMs,
+higher-throughput FP8), not a software gap.
+
+## Performance Comparison: Orin vs ThorU
+
+### Measured Phase Breakdown
+
+| Phase | Orin SM87 (INT8) | ThorU SM110 (FP8) | Ratio |
+|---|---|---|---|
+| Vision SigLIP 27L | 26 ms | ~10 ms | 2.6× |
+| Encoder Gemma-2B 18L | 66 ms | ~18 ms | 3.7× |
+| Decoder 300M 18L×10 steps | 59 ms | ~17 ms | 3.5× |
+| **Total (10 steps, 2-cam)** | **~151 ms / 6.6 Hz** | **~45 ms / 22 Hz** | **3.4×** |
+
+GPU specs: Orin = 16 SMs, 61 GB unified; ThorU = more SMs, same ~204 GB/s BW.
+
+### Root Cause of the Gap
+
+Memory bandwidth is identical (~204 GB/s) — **bandwidth is not the bottleneck**.
+
+```
+Largest GEMM: encoder gate+up (560, 32768, 2048)
+  Tile count: ceil(560/128) × ceil(32768/128) = 5 × 256 = 1280 blocks
+
+  Orin  16 SM: 1280 / 16 = 80 waves  → many sequential rounds
+  ThorU N  SM: 1280 / N  = <<80 waves → N≈4–6× more SMs → ~4× faster here
+```
+
+Three compounding factors:
+
+1. **SM count** (primary): Orin has 16 SMs; ThorU has significantly more.
+   Large GEMMs require many sequential "waves" on Orin, each using all 16 SMs.
+
+2. **FP8 vs INT8 tensor core throughput** (secondary):
+   SM110 has dedicated FP8 tensor cores with higher TOPS/SM.
+   SM87 (Ampere) has INT8 tensor cores; no native FP8.
+
+3. **GEMM epilogue fusion** (tertiary):
+   ThorU: `fp8_nn_gelu_bias` — GEMM + bias + GELU in one kernel.
+   Orin: three separate kernels (GEMM, bias_add, gelu_inplace).
+   `CUBLASLT_EPILOGUE_BIAS` returns NOT_SUPPORTED on SM87 for BF16.
+
+The 3.4× gap is a **hardware gap**, not primarily a software gap.
+Software optimizations (INT8 quantization, fused norm kernels, autotune)
+have already extracted most of the available headroom on SM87.
+
 ## Comparison with ThorU
 
 Both machines have ~204 GB/s memory bandwidth. ThorU is faster due to:
