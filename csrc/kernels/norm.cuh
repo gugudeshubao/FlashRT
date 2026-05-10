@@ -116,6 +116,16 @@ void residual_add_rms_norm_fp8_noweight_bf16(__nv_bfloat16* residual, const __nv
                                                const float* d_scale,
                                                cudaStream_t stream = 0);
 
+// ── Vision Token Spatial Average Pooling ──
+
+// Reduce (nv * H * W, dim) BF16 to (nv * (H/f) * (W/f), dim) BF16
+// via f×f spatial average pooling within each view's H×W token grid.
+// H = W = sqrt(spv) (e.g. 16 for spv=256); pool_factor f must divide H.
+void avg_pool_vision_tokens(
+        const __nv_bfloat16* x, __nv_bfloat16* out,
+        int nv, int H, int W, int dim, int pool_factor,
+        cudaStream_t stream = 0);
+
 // ── Fused RMSNorm → INT8 rowwise (Orin encoder hot-path) ──
 
 // RMSNorm(x, weight) → INT8 with per-row dynamic scales.

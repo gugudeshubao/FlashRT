@@ -157,6 +157,7 @@ class Pi05Pipeline:
                  use_int8_decoder: bool = False,
                  use_int8_encoder: bool = False,
                  use_int8_vision: bool = False,
+                 vision_pool_factor: int = 1,
                  num_steps: int = NUM_STEPS_DEFAULT):
         self.gemm = gemm
         self.fvk = fvk
@@ -172,10 +173,15 @@ class Pi05Pipeline:
         self.use_int8_decoder = bool(use_int8_decoder)
         self.use_int8_encoder = bool(use_int8_encoder)
         self.use_int8_vision = bool(use_int8_vision)
+        self.vision_pool_factor = int(vision_pool_factor)
 
         # Derived sizes
+        # vision_seq: full SigLIP token count (pre-pooling) — used for SigLIP buffers
+        # vision_seq_enc: token count fed to the Gemma encoder (post-pooling)
         self.vision_seq = self.num_views * VIS_SEQ_PER_VIEW
-        self.encoder_seq_len = self.vision_seq + self.max_prompt_len
+        pf = self.vision_pool_factor
+        self.vision_seq_enc = self.vision_seq // (pf * pf)
+        self.encoder_seq_len = self.vision_seq_enc + self.max_prompt_len
         self.total_kv = self.encoder_seq_len + self.chunk_size
 
         # Attention pointers (owned by attn_backend)
@@ -255,9 +261,15 @@ class Pi05Pipeline:
         # observation_images_normalized is the input slot; frontend writes here.
         B["observation_images_normalized"] = CudaBuffer.device_empty(
             nv * 224 * 224 * 3, BF16)
-        # Patch-embedded + residual stream
+        # Patch-embedded + residual stream (full pre-pool token count)
         B["vision_x"] = CudaBuffer.device_empty(vs * VIS_D, BF16)
         B["vision_x_norm"] = CudaBuffer.device_empty(vs * VIS_D, BF16)
+        # Pooled vision tokens fed to the Gemma encoder (== vision_x when pool_factor=1)
+        vs_enc = self.vision_seq_enc
+        if self.vision_pool_factor > 1:
+            B["vision_x_pooled"] = CudaBuffer.device_empty(vs_enc * VIS_D, BF16)
+        else:
+            B["vision_x_pooled"] = B["vision_x"]  # no-op alias
         B["vision_QKV"] = CudaBuffer.device_empty(vs * 3 * VIS_D, BF16)
         B["vision_hidden"] = CudaBuffer.device_empty(vs * VIS_H, BF16)
         # Position embedding expanded (nv * 256, 1152) — built once, reused
@@ -380,15 +392,18 @@ class Pi05Pipeline:
         self.bufs["encoder_rope_weights"] = CudaBuffer.from_numpy(
             np.ascontiguousarray(enc_rope_slice))
 
-        # Decoder RoPE: placeholder, will be overwritten per-prompt
+        # Decoder RoPE: placeholder, will be overwritten per-prompt.
+        # Positions start after the pooled vision tokens + prompt — use
+        # vision_seq_enc (not vision_seq) so the rope table isn't overrun
+        # when vision_pool_factor > 1.
         dec_rope_slice = interleaved[
-            self.vision_seq - 1 : self.vision_seq - 1 + self.chunk_size]
+            self.vision_seq_enc - 1 : self.vision_seq_enc - 1 + self.chunk_size]
         self.bufs["decoder_rope_weights"] = CudaBuffer.from_numpy(
             np.ascontiguousarray(dec_rope_slice))
 
     def _set_decoder_rope_for_prompt(self, prompt_len: int) -> None:
         """Update ``decoder_rope_weights`` for a new prompt length."""
-        start = self.vision_seq + prompt_len - 1
+        start = self.vision_seq_enc + prompt_len - 1
         end = start + self.chunk_size
         self.bufs["decoder_rope_weights"].upload(
             np.ascontiguousarray(self._rope_table_np[start:end]))
@@ -694,6 +709,17 @@ class Pi05Pipeline:
         for i in range(VIS_L):
             self._vision_layer(i, seq, use_fp8, stream)
 
+        # A7 (optional): Spatial average pooling — reduce (nv*256, D) to (nv*64, D)
+        # Runs only when vision_pool_factor > 1. vision_x_pooled is a separate
+        # buffer; vision_x stays intact so this is non-destructive.
+        if self.vision_pool_factor > 1:
+            H = W_grid = 16  # 14×14 patches → 16×16 after im2col rounding? actually 16×16
+            # VIS_SEQ_PER_VIEW = 256 = 16 × 16
+            fvk.avg_pool_vision_tokens(
+                B["vision_x"].ptr.value,
+                B["vision_x_pooled"].ptr.value,
+                nv, H, H, VIS_D, self.vision_pool_factor, stream)
+
     def _vision_layer(self, i: int, seq: int, use_fp8: bool, stream: int) -> None:
         """One SigLIP transformer layer (pre-norm, LayerNorm, GELU FFN)."""
         fvk = self.fvk
@@ -834,32 +860,35 @@ class Pi05Pipeline:
         W = self.weights
         B = self.bufs
         seq = self.encoder_seq_len
-        vs = self.vision_seq
+        # vs_enc: token count fed to the encoder (post-pool); equals vision_seq when no pooling
+        vs_enc = self.vision_seq_enc
         use_fp8 = self.use_fp8
 
-        # B0: LayerNorm(vision output) → project 1152→2048 + bias → encoder_x[:vs]
+        # B0: LayerNorm(vision output) → project 1152→2048 + bias → encoder_x[:vs_enc]
+        # When vision_pool_factor > 1, read from vision_x_pooled (reduced token count);
+        # otherwise vision_x_pooled aliases vision_x so behaviour is unchanged.
         fvk.layer_norm(
-            B["vision_x"].ptr.value,
+            B["vision_x_pooled"].ptr.value,
             W["vision_final_norm_w"], W["vision_final_norm_b"],
             B["vision_x_norm"].ptr.value,
-            vs, VIS_D, 1e-5, stream=stream)
+            vs_enc, VIS_D, 1e-5, stream=stream)
 
         if use_fp8 and "vision_projector_w" in self.weights.get("fp8", {}):
             self._fp8_gemm(
-                B["vision_x_norm"].ptr.value, vs * VIS_D,
+                B["vision_x_norm"].ptr.value, vs_enc * VIS_D,
                 "vision_projector_w",
                 B["encoder_x"].ptr.value,
-                vs, ENC_D, VIS_D, stream)
+                vs_enc, ENC_D, VIS_D, stream)
         else:
             gemm.bf16_nn(
                 B["vision_x_norm"].ptr.value, W["encoder_multi_modal_projector_w"],
                 B["encoder_x"].ptr.value,
-                vs, ENC_D, VIS_D, stream=stream)
+                vs_enc, ENC_D, VIS_D, stream=stream)
         fvk.add_bias_bf16(
             B["encoder_x"].ptr.value, W["encoder_multi_modal_projector_b"],
-            vs, ENC_D, stream=stream)
+            vs_enc, ENC_D, stream=stream)
 
-        # Language embeds have been written by frontend into encoder_x[vs:vs+lang_len]
+        # Language embeds have been written by frontend into encoder_x[vs_enc:vs_enc+lang_len]
 
         # B1-B5: 18 encoder layers. Fuse previous B5 residual into this B1's RMS→FP8
         fused = use_fp8 and self.fp8_calibrated
@@ -1441,7 +1470,7 @@ class Pi05Pipeline:
                  W["vision_ffn_up_w"][0]),
                 (vs, VIS_D,     VIS_H, "vision_hidden",  "vision_x_norm",
                  W["vision_ffn_down_w"][0]),
-                (vs, ENC_D,     VIS_D, "vision_x_norm",  "encoder_x",
+                (self.vision_seq_enc, ENC_D, VIS_D, "vision_x_norm", "encoder_x",
                  W["encoder_multi_modal_projector_w"]),
             ]:
                 gemm.autotune_bf16_nn(
@@ -1611,7 +1640,7 @@ class Pi05Pipeline:
         """D2D copy stored lang embeds into encoder_x[vs:vs+prompt_len]."""
         if not hasattr(self, "_lang_embeds_buf"):
             return  # set_language_embeds not called yet (first build)
-        start_byte = self.vision_seq * ENC_D * 2
+        start_byte = self.vision_seq_enc * ENC_D * 2  # language embeds follow pooled vision tokens
         dst_ptr = self.bufs["encoder_x"].ptr.value + start_byte
         self._cudart.cudaMemcpyAsync(
             ctypes.c_void_p(dst_ptr),

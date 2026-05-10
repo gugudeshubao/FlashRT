@@ -444,12 +444,14 @@ class Pi05TorchFrontendRtx:
                  num_views: int = 2,
                  chunk_size: int = CHUNK_SIZE,
                  max_prompt_len: int = MAX_PROMPT_LEN_DEFAULT,
-                 num_steps: int = NUM_STEPS_DEFAULT):
+                 num_steps: int = NUM_STEPS_DEFAULT,
+                 vision_pool_factor: int = 1):
         checkpoint_dir = pathlib.Path(checkpoint_dir)
         self.num_views = int(num_views)
         self.chunk_size = int(chunk_size)
         self.max_prompt_len = int(max_prompt_len)
         self._num_steps = int(num_steps)
+        self._vision_pool_factor = int(vision_pool_factor)
 
         self.latency_records: list[float] = []
         self.calibrated = False
@@ -924,6 +926,7 @@ class Pi05TorchFrontendRtx:
                 max_prompt_len=prompt_len,
                 chunk_size=self.chunk_size,
                 num_steps=self._num_steps,
+                vision_pool_factor=self._vision_pool_factor,
                 **self._pipeline_precision_kwargs())
 
         # Upload language embeds into pipeline's encoder_x slot

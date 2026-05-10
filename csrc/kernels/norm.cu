@@ -1098,3 +1098,59 @@ void residual_add_rms_norm_int8_rowwise(
     residual_add_rms_norm_int8_rowwise_kernel<<<seq_len, 256, smem, stream>>>(
         residual, x, weight, out, scales, seq_len, dim, eps);
 }
+
+// ── Vision Token Spatial Average Pooling (BF16) ──
+//
+// Reduces SigLIP output from (nv * spv, dim) to (nv * spv / (f*f), dim)
+// by applying f×f average pooling in the spatial (H, W) grid.
+//
+// Token layout: each view's spv tokens are arranged as an (H, W) grid
+// with H = W = sqrt(spv). The kernel averages each f×f block of tokens
+// into one output token, reducing spv to spv/(f*f) per view.
+//
+// Launch: gridDim = (nv * out_spv, 1), blockDim = (256, 1)
+//         where out_spv = spv / (f*f)
+// smem: not needed (pure BW-limited kernel)
+__global__ void avg_pool_vision_tokens_kernel(
+        const __nv_bfloat16* __restrict__ x,   // (nv * spv, dim) BF16
+        __nv_bfloat16* __restrict__ out,        // (nv * out_spv, dim) BF16
+        int nv, int H, int W, int dim, int f) {
+    // output token index in [0, nv * (H/f) * (W/f))
+    int out_tok = blockIdx.x;
+    int H_out = H / f;
+    int W_out = W / f;
+    int spv_out = H_out * W_out;
+
+    int v   = out_tok / spv_out;          // view index
+    int rc  = out_tok % spv_out;          // spatial index within view
+    int r_out = rc / W_out;
+    int c_out = rc % W_out;
+
+    float inv_f2 = 1.0f / float(f * f);
+
+    for (int d = threadIdx.x; d < dim; d += blockDim.x) {
+        float sum = 0.f;
+        for (int dr = 0; dr < f; dr++) {
+            for (int dc = 0; dc < f; dc++) {
+                int r_in  = r_out * f + dr;
+                int c_in  = c_out * f + dc;
+                int in_tok = v * H * W + r_in * W + c_in;
+                sum += __bfloat162float(x[in_tok * dim + d]);
+            }
+        }
+        out[out_tok * dim + d] = __float2bfloat16(sum * inv_f2);
+    }
+}
+
+// pool_factor: 1 = no-op, 2 = 2x2 (spv 256→64), 4 = 4x4 (spv 256→16)
+// H = W = sqrt(spv) must be divisible by pool_factor.
+void avg_pool_vision_tokens(
+        const __nv_bfloat16* x, __nv_bfloat16* out,
+        int nv, int H, int W, int dim, int pool_factor,
+        cudaStream_t stream) {
+    int H_out = H / pool_factor;
+    int W_out = W / pool_factor;
+    int out_tokens = nv * H_out * W_out;
+    avg_pool_vision_tokens_kernel<<<out_tokens, 256, 0, stream>>>(
+        x, out, nv, H, W, dim, pool_factor);
+}

@@ -416,6 +416,16 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
        py::arg("seq_len"), py::arg("dim"), py::arg("eps") = 1e-6f,
        py::arg("d_scales") = 0, py::arg("stream") = 0);
 
+    m.def("avg_pool_vision_tokens", [](uintptr_t x, uintptr_t out,
+                                        int nv, int H, int W, int dim,
+                                        int pool_factor, uintptr_t stream) {
+        avg_pool_vision_tokens(
+            reinterpret_cast<const __nv_bfloat16*>(x),
+            reinterpret_cast<__nv_bfloat16*>(out),
+            nv, H, W, dim, pool_factor, to_stream(stream));
+    }, py::arg("x"), py::arg("out"), py::arg("nv"), py::arg("H"), py::arg("W"),
+       py::arg("dim"), py::arg("pool_factor"), py::arg("stream") = 0);
+
     m.def("rms_norm_int8_rowwise", [](uintptr_t x, uintptr_t weight,
                                        uintptr_t out, uintptr_t scales,
                                        int seq_len, int dim, float eps,
