@@ -158,6 +158,7 @@ class Pi05Pipeline:
                  use_int8_encoder: bool = False,
                  use_int8_vision: bool = False,
                  vision_pool_factor: int = 1,
+                 vision_num_layers: int = VIS_L,
                  num_steps: int = NUM_STEPS_DEFAULT):
         self.gemm = gemm
         self.fvk = fvk
@@ -174,6 +175,7 @@ class Pi05Pipeline:
         self.use_int8_encoder = bool(use_int8_encoder)
         self.use_int8_vision = bool(use_int8_vision)
         self.vision_pool_factor = int(vision_pool_factor)
+        self.vision_num_layers = int(vision_num_layers)
 
         # Derived sizes
         # vision_seq: full SigLIP token count (pre-pooling) — used for SigLIP buffers
@@ -703,10 +705,11 @@ class Pi05Pipeline:
             W["vision_patch_embedding_b"],
             seq, VIS_D, stream=stream)
 
-        # A2-A6: 27 transformer layers
+        # A2-A6: SigLIP transformer layers (vision_num_layers ≤ VIS_L=27)
+        # Reducing layers is a quality/speed trade-off (untrained skip).
         use_fp8 = self.use_fp8 and "vision_attn_qkv_w_0" in self.weights.get("fp8", {})
 
-        for i in range(VIS_L):
+        for i in range(self.vision_num_layers):
             self._vision_layer(i, seq, use_fp8, stream)
 
         # A7 (optional): Spatial average pooling — reduce (nv*256, D) to (nv*64, D)
