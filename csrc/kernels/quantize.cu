@@ -204,6 +204,135 @@ void quantize_fp8_device_fp16(const __half* input, __nv_fp8_e4m3* output,
     quantize_fp8_kernel_generic<__half><<<blocks, threads, 0, stream>>>(input, output, d_scale, n);
 }
 
+// ── INT8 dynamic quant + dequant (graph-compatible, BF16 activations) ──
+
+__global__ void compute_scale_int8_kernel(const float* d_absmax, float* d_scale) {
+    float amax = *d_absmax;
+    float scale = amax / 127.0f;
+    if (scale < 1e-12f) scale = 1e-12f;
+    *d_scale = scale;
+}
+
+template<typename T>
+__global__ void quantize_int8_kernel_generic(
+    const T* __restrict__ input,
+    int8_t* __restrict__ output,
+    const float* __restrict__ scale,
+    int n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    float inv_s = 1.0f / fmaxf(*scale, 1e-12f);
+    float v = to_f32(input[idx]) * inv_s;
+    int q = __float2int_rn(v);
+    q = (q < -127) ? -127 : ((q > 127) ? 127 : q);
+    output[idx] = static_cast<int8_t>(q);
+}
+
+template __global__ void quantize_int8_kernel_generic<__nv_bfloat16>(
+    const __nv_bfloat16*, int8_t*, const float*, int);
+
+void quantize_int8_device(const __nv_bfloat16* input, int8_t* output,
+                          float* d_scale, int n, cudaStream_t stream) {
+    cudaMemsetAsync(d_scale, 0, sizeof(float), stream);
+
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    if (blocks > 1024) blocks = 1024;
+    absmax_kernel<__nv_bfloat16><<<blocks, threads, threads * sizeof(float), stream>>>(
+        input, d_scale, n);
+
+    compute_scale_int8_kernel<<<1, 1, 0, stream>>>(d_scale, d_scale);
+    blocks = (n + threads - 1) / threads;
+    quantize_int8_kernel_generic<__nv_bfloat16><<<blocks, threads, 0, stream>>>(
+        input, output, d_scale, n);
+}
+
+__global__ void quantize_int8_rowwise_kernel(
+    const __nv_bfloat16* __restrict__ input,
+    int8_t* __restrict__ output,
+    float* __restrict__ scales,
+    int rows, int cols)
+{
+    int row = blockIdx.x;
+    if (row >= rows) return;
+
+    const __nv_bfloat16* in_row = input + static_cast<size_t>(row) * cols;
+    int8_t* out_row = output + static_cast<size_t>(row) * cols;
+
+    float tmax = 0.0f;
+    for (int j = threadIdx.x; j < cols; j += blockDim.x) {
+        tmax = fmaxf(tmax, fabsf(__bfloat162float(in_row[j])));
+    }
+
+    for (int off = 16; off > 0; off >>= 1) {
+        tmax = fmaxf(tmax, __shfl_xor_sync(0xffffffff, tmax, off));
+    }
+
+    __shared__ float warp_max[8];
+    int wid = threadIdx.x >> 5;
+    int lid = threadIdx.x & 31;
+    if (lid == 0) {
+        warp_max[wid] = tmax;
+    }
+    __syncthreads();
+
+    if (wid == 0) {
+        tmax = (lid < (blockDim.x >> 5)) ? warp_max[lid] : 0.0f;
+        for (int off = 4; off > 0; off >>= 1) {
+            tmax = fmaxf(tmax, __shfl_xor_sync(0xffffffff, tmax, off));
+        }
+    }
+
+    __shared__ float scale_s;
+    if (threadIdx.x == 0) {
+        float s = fmaxf(tmax / 127.0f, 1e-10f);
+        scales[row] = s;
+        scale_s = s;
+    }
+    __syncthreads();
+
+    float inv_s = 1.0f / scale_s;
+    for (int j = threadIdx.x; j < cols; j += blockDim.x) {
+        float v = __bfloat162float(in_row[j]) * inv_s;
+        int q = __float2int_rn(v);
+        q = (q < -127) ? -127 : ((q > 127) ? 127 : q);
+        out_row[j] = static_cast<int8_t>(q);
+    }
+}
+
+void quantize_int8_rowwise(const __nv_bfloat16* input, int8_t* output,
+                           float* d_scales, int rows, int cols,
+                           cudaStream_t stream) {
+    int threads = (cols < 256) ? cols : 256;
+    threads = ((threads + 31) / 32) * 32;
+    if (threads < 32) threads = 32;
+    quantize_int8_rowwise_kernel<<<rows, threads, 0, stream>>>(
+        input, output, d_scales, rows, cols);
+}
+
+__global__ void dequant_int32_to_bf16_kernel(
+    const int32_t* __restrict__ input,
+    __nv_bfloat16* __restrict__ output,
+    const float* __restrict__ d_act_scale,
+    const float* __restrict__ d_weight_scale,
+    int n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    float scale = (*d_act_scale) * (*d_weight_scale);
+    output[idx] = __float2bfloat16(static_cast<float>(input[idx]) * scale);
+}
+
+void dequant_int32_to_bf16(const int32_t* input, __nv_bfloat16* output,
+                           const float* d_act_scale, const float* d_weight_scale,
+                           int n, cudaStream_t stream) {
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    dequant_int32_to_bf16_kernel<<<blocks, threads, 0, stream>>>(
+        input, output, d_act_scale, d_weight_scale, n);
+}
+
 #ifdef ENABLE_NVFP4
 // ================================================================
 //  NVFP4 (E2M1) Quantization with per-16-block UE4M3 scale factors

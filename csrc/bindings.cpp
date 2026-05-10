@@ -129,6 +129,9 @@ extern "C" void tq_cutlass_k_combine_launch(
     const void* sr_fp32,
     const void* norm_k_fp32, const void* coef_rnorm_fp32,
     void* d_bf16, int M, int N, int K, cudaStream_t stream);
+extern "C" int cutlass_int8_rowwise_bf16out(
+    void const* A, void const* B, void const* act_scale, void const* weight_scale,
+    void* D, int M, int N, int K, cudaStream_t stream);
 extern "C" void tq_dequant_kv_fused_launch(
     const void* k_idx_packed, const void* k_qjl_packed,
     const void* k_norm, const void* k_rnorm,
@@ -218,6 +221,12 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
                             uintptr_t A, uintptr_t B, uintptr_t D,
                             int M, int N, int K, uintptr_t stream) {
             self.fp16_nn(to_ptr(A), to_ptr(B), to_ptr(D), M, N, K, to_stream(stream));
+        }, py::arg("A"), py::arg("B"), py::arg("D"),
+           py::arg("M"), py::arg("N"), py::arg("K"), py::arg("stream") = 0)
+        .def("int8_nn", [](GemmRunner& self,
+                           uintptr_t A, uintptr_t B, uintptr_t D,
+                           int M, int N, int K, uintptr_t stream) {
+            self.int8_nn(to_ptr(A), to_ptr(B), to_ptr(D), M, N, K, to_stream(stream));
         }, py::arg("A"), py::arg("B"), py::arg("D"),
            py::arg("M"), py::arg("N"), py::arg("K"), py::arg("stream") = 0)
         .def("bf16_nn", [](GemmRunner& self,
@@ -315,6 +324,12 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
             self.autotune_bf16_nn(to_ptr(A), to_ptr(B), to_ptr(D), M, N, K, num_algos);
         }, py::arg("A"), py::arg("B"), py::arg("D"),
            py::arg("M"), py::arg("N"), py::arg("K"), py::arg("num_algos") = 16)
+        .def("autotune_int8_nn", [](GemmRunner& self,
+                                     uintptr_t A, uintptr_t B, uintptr_t D,
+                                     int M, int N, int K, int num_algos) {
+            self.autotune_int8_nn(to_ptr(A), to_ptr(B), to_ptr(D), M, N, K, num_algos);
+        }, py::arg("A"), py::arg("B"), py::arg("D"),
+           py::arg("M"), py::arg("N"), py::arg("K"), py::arg("num_algos") = 16)
         .def("autotune_fp8_nn_dev", [](GemmRunner& self,
                                         uintptr_t A, uintptr_t B, uintptr_t D,
                                         int M, int N, int K,
@@ -386,6 +401,47 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     }, py::arg("x"), py::arg("weight"), py::arg("style"),
        py::arg("out"), py::arg("gate_out"),
        py::arg("seq_len"), py::arg("dim"), py::arg("eps") = 1e-6f, py::arg("stream") = 0);
+
+    m.def("ada_rms_norm_style_int8", [](uintptr_t x, uintptr_t weight, uintptr_t style,
+                                         uintptr_t out, uintptr_t gate_out,
+                                         int seq_len, int dim, float eps,
+                                         uintptr_t d_scales, uintptr_t stream) {
+        ada_rms_norm_style_int8(
+            typed_ptr<__nv_bfloat16>(x), typed_ptr<__nv_bfloat16>(weight),
+            typed_ptr<__nv_bfloat16>(style), typed_ptr<int8_t>(out),
+            typed_ptr<__nv_bfloat16>(gate_out), seq_len, dim, eps,
+            reinterpret_cast<float*>(d_scales), to_stream(stream));
+    }, py::arg("x"), py::arg("weight"), py::arg("style"),
+       py::arg("out"), py::arg("gate_out"),
+       py::arg("seq_len"), py::arg("dim"), py::arg("eps") = 1e-6f,
+       py::arg("d_scales") = 0, py::arg("stream") = 0);
+
+    m.def("rms_norm_int8_rowwise", [](uintptr_t x, uintptr_t weight,
+                                       uintptr_t out, uintptr_t scales,
+                                       int seq_len, int dim, float eps,
+                                       uintptr_t stream) {
+        rms_norm_int8_rowwise(
+            typed_ptr<__nv_bfloat16>(x), typed_ptr<__nv_bfloat16>(weight),
+            typed_ptr<int8_t>(out), reinterpret_cast<float*>(scales),
+            seq_len, dim, eps, to_stream(stream));
+    }, py::arg("x"), py::arg("weight"), py::arg("out"), py::arg("scales"),
+       py::arg("seq_len"), py::arg("dim"), py::arg("eps") = 1e-6f,
+       py::arg("stream") = 0);
+
+    m.def("residual_add_rms_norm_int8_rowwise", [](uintptr_t residual, uintptr_t x,
+                                                    uintptr_t weight,
+                                                    uintptr_t out, uintptr_t scales,
+                                                    int seq_len, int dim, float eps,
+                                                    uintptr_t stream) {
+        residual_add_rms_norm_int8_rowwise(
+            typed_ptr<__nv_bfloat16>(residual), typed_ptr<__nv_bfloat16>(x),
+            typed_ptr<__nv_bfloat16>(weight),
+            typed_ptr<int8_t>(out), reinterpret_cast<float*>(scales),
+            seq_len, dim, eps, to_stream(stream));
+    }, py::arg("residual"), py::arg("x"), py::arg("weight"),
+       py::arg("out"), py::arg("scales"),
+       py::arg("seq_len"), py::arg("dim"), py::arg("eps") = 1e-6f,
+       py::arg("stream") = 0);
 
     // Fused Norm → FP8
     m.def("rms_norm_fp8", [](uintptr_t x, uintptr_t weight, uintptr_t out,
@@ -554,6 +610,23 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
        py::arg("style"), py::arg("out"), py::arg("gate_out"),
        py::arg("seq_len"), py::arg("dim"), py::arg("eps") = 1e-6f,
        py::arg("d_scale") = 0, py::arg("stream") = 0);
+
+    m.def("gate_residual_ada_norm_int8", [](uintptr_t residual, uintptr_t x,
+                                             uintptr_t gate, uintptr_t weight,
+                                             uintptr_t style,
+                                             uintptr_t out, uintptr_t gate_out,
+                                             int seq_len, int dim, float eps,
+                                             uintptr_t d_scales, uintptr_t stream) {
+        gate_residual_ada_norm_int8(
+            typed_ptr<__nv_bfloat16>(residual), typed_ptr<__nv_bfloat16>(x),
+            typed_ptr<__nv_bfloat16>(gate), typed_ptr<__nv_bfloat16>(weight),
+            typed_ptr<__nv_bfloat16>(style), typed_ptr<int8_t>(out),
+            typed_ptr<__nv_bfloat16>(gate_out), seq_len, dim, eps,
+            reinterpret_cast<float*>(d_scales), to_stream(stream));
+    }, py::arg("residual"), py::arg("x"), py::arg("gate"), py::arg("weight"),
+       py::arg("style"), py::arg("out"), py::arg("gate_out"),
+       py::arg("seq_len"), py::arg("dim"), py::arg("eps") = 1e-6f,
+       py::arg("d_scales") = 0, py::arg("stream") = 0);
 
     // Quantize
     m.def("quantize_fp8", [](uintptr_t input, uintptr_t output,
@@ -847,6 +920,47 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
                                   typed_ptr<__nv_fp8_e4m3>(output),
                                   reinterpret_cast<const float*>(d_scale), n, to_stream(stream));
     }, py::arg("input"), py::arg("output"), py::arg("d_scale"), py::arg("n"), py::arg("stream") = 0);
+
+    m.def("quantize_int8_device", [](uintptr_t input, uintptr_t output,
+                                      uintptr_t d_scale, int n, uintptr_t stream) {
+        quantize_int8_device(reinterpret_cast<const __nv_bfloat16*>(input),
+                             typed_ptr<int8_t>(output),
+                             reinterpret_cast<float*>(d_scale),
+                             n, to_stream(stream));
+    }, py::arg("input"), py::arg("output"), py::arg("d_scale"), py::arg("n"), py::arg("stream") = 0);
+
+    m.def("quantize_int8_rowwise", [](uintptr_t input, uintptr_t output,
+                                       uintptr_t d_scales, int rows, int cols,
+                                       uintptr_t stream) {
+        quantize_int8_rowwise(reinterpret_cast<const __nv_bfloat16*>(input),
+                              typed_ptr<int8_t>(output),
+                              reinterpret_cast<float*>(d_scales),
+                              rows, cols, to_stream(stream));
+    }, py::arg("input"), py::arg("output"), py::arg("d_scales"),
+       py::arg("rows"), py::arg("cols"), py::arg("stream") = 0);
+
+    m.def("dequant_int32_to_bf16", [](uintptr_t input, uintptr_t output,
+                                       uintptr_t d_act_scale, uintptr_t d_weight_scale,
+                                       int n, uintptr_t stream) {
+        dequant_int32_to_bf16(typed_ptr<int32_t>(input),
+                              reinterpret_cast<__nv_bfloat16*>(output),
+                              reinterpret_cast<const float*>(d_act_scale),
+                              reinterpret_cast<const float*>(d_weight_scale),
+                              n, to_stream(stream));
+    }, py::arg("input"), py::arg("output"),
+       py::arg("d_act_scale"), py::arg("d_weight_scale"),
+       py::arg("n"), py::arg("stream") = 0);
+
+    m.def("cutlass_int8_rowwise_bf16out",
+          [](uintptr_t A, uintptr_t B, uintptr_t act_scale, uintptr_t weight_scale,
+             uintptr_t D, int M, int N, int K, uintptr_t stream) {
+              return cutlass_int8_rowwise_bf16out(
+                  to_ptr(A), to_ptr(B), to_ptr(act_scale), to_ptr(weight_scale),
+                  to_ptr(D), M, N, K, to_stream(stream));
+          },
+          py::arg("A"), py::arg("B"), py::arg("act_scale"), py::arg("weight_scale"),
+          py::arg("D"), py::arg("M"), py::arg("N"), py::arg("K"),
+          py::arg("stream") = 0);
 
     // ── Decoder fused kernels (FP16, matching pi05 ae_forward_static) ──
     m.def("fused_adarms_fp8_static_fp16", [](uintptr_t x, uintptr_t style,

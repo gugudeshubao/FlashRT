@@ -213,7 +213,10 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                                       those classes have SM120 runtime forks
                                       where needed, e.g. Pi0-FAST.)
               SM89  (RTX 4090)     → ``flash_rt.hardware.rtx.*``
-            Pass ``"thor"`` / ``"rtx_sm120"`` / ``"rtx_sm89"`` explicitly to
+              SM87  (Jetson Orin)  → ``flash_rt.hardware.rtx.*`` (experimental,
+                                     BF16-only for Pi0.5 torch)
+            Pass ``"thor"`` / ``"rtx_sm120"`` / ``"rtx_sm89"`` /
+            ``"rtx_sm87"`` explicitly to
             force a specific backend (useful for cross-hardware debugging).
         embodiment_tag: GROOT only. Per-embodiment MLP slot to load. Passing
             ``None`` uses the backend default (``"new_embodiment"`` — unfit

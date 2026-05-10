@@ -158,18 +158,10 @@ class Pi05TorchFrontendThor:
 
     def _load_norm_stats(self, checkpoint_dir):
         from flash_rt.core.utils.norm_stats import (
-            load_norm_stats, lerobot_candidates,
+            load_norm_stats, pi05_candidates,
         )
-        candidates = [
-            checkpoint_dir / "assets" / "physical-intelligence" / "libero" / "norm_stats.json",
-            checkpoint_dir.parent / "pi05_libero" / "assets" / "physical-intelligence" / "libero" / "norm_stats.json",
-            checkpoint_dir / "norm_stats.json",
-            pathlib.Path("/root/.cache/openpi/openpi-assets/checkpoints/pi05_libero/"
-                         "assets/physical-intelligence/libero/norm_stats.json"),
-            *lerobot_candidates(checkpoint_dir),
-        ]
         self.norm_stats = load_norm_stats(
-            candidates, checkpoint_dir=checkpoint_dir)
+            pi05_candidates(checkpoint_dir), checkpoint_dir=checkpoint_dir)
 
     # -----------------------------------------------------------------------
     # Weight loading

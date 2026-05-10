@@ -90,6 +90,7 @@ BF16 = np.float16            # sizing placeholder only
 BF16_NP = ml_dtypes.bfloat16  # real BF16 numpy dtype for numeric staging
 FP8 = np.uint8
 FP32 = np.float32
+INT8 = np.int8
 
 
 class Pi05Pipeline:
@@ -111,6 +112,7 @@ class Pi05Pipeline:
         chunk_size:   Diffusion action chunk length (default 10).
         use_fp8:      Enable FP8 E4M3 quantization for large GEMMs.
         use_fp8_decoder: Enable FP8 on decoder branch (else BF16).
+        use_int8_decoder: Enable experimental decoder-only INT8 GEMMs.
         num_steps:    Diffusion denoise steps (default 10).
 
     Expected weights dict keys:
@@ -141,6 +143,9 @@ class Pi05Pipeline:
         Decoder FP8:
             fp8.decoder_attn_qkv_w_{0..17}, fp8.decoder_attn_o_w_{0..17},
             fp8.decoder_ffn_gate_up_w_{0..17}, fp8.decoder_ffn_down_w_{0..17},
+        Decoder INT8:
+            int8.decoder_attn_qkv_w_{0..17}, int8.decoder_attn_o_w_{0..17},
+            int8.decoder_ffn_gate_up_w_{0..17}, int8.decoder_ffn_down_w_{0..17},
         Language (rebound per-prompt by frontend):
             language_embeds_ptr   — pointer to bf16 (max_prompt_len, 2048) buffer
     """
@@ -149,6 +154,9 @@ class Pi05Pipeline:
                  num_views: int, max_prompt_len: int,
                  chunk_size: int = NUM_STEPS_DEFAULT,
                  use_fp8: bool = True, use_fp8_decoder: bool = True,
+                 use_int8_decoder: bool = False,
+                 use_int8_encoder: bool = False,
+                 use_int8_vision: bool = False,
                  num_steps: int = NUM_STEPS_DEFAULT):
         self.gemm = gemm
         self.fvk = fvk
@@ -161,6 +169,9 @@ class Pi05Pipeline:
         self.num_steps = int(num_steps)
         self.use_fp8 = bool(use_fp8)
         self.use_fp8_decoder = bool(use_fp8_decoder)
+        self.use_int8_decoder = bool(use_int8_decoder)
+        self.use_int8_encoder = bool(use_int8_encoder)
+        self.use_int8_vision = bool(use_int8_vision)
 
         # Derived sizes
         self.vision_seq = self.num_views * VIS_SEQ_PER_VIEW
@@ -191,6 +202,9 @@ class Pi05Pipeline:
         self.fp8_act_scales = {}  # name -> CudaBuffer(1, fp32)
         self.fp8_calibrated = False
         self._allocate_fp8_scratch()
+        self.int8_act_scales = {}  # name -> CudaBuffer(rows, fp32), runtime-dynamic
+        self._allocate_int8_scratch()
+        self._allocate_encoder_int8_scratch()
 
         # Pre-computed decoder style params — frontend pre-computes these in
         # its native framework and passes raw bf16 bytes; see frontend's
@@ -201,6 +215,20 @@ class Pi05Pipeline:
         self._graph = None
         self._graph_stream = None  # ctypes.c_void_p
         self._cudart = ctypes.CDLL("libcudart.so")
+        # Keep libcudart call signatures explicit. Some aarch64 Python
+        # environments will otherwise pass pointer-sized arguments
+        # through ctypes with the wrong default conversion, which can
+        # crash in calibration / prompt-upload copies before we ever
+        # reach the actual kernels.
+        self._cudart.cudaMemcpyAsync.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t,
+            ctypes.c_int, ctypes.c_void_p,
+        ]
+        self._cudart.cudaMemcpyAsync.restype = ctypes.c_int
+        self._cudart.cudaStreamSynchronize.argtypes = [ctypes.c_void_p]
+        self._cudart.cudaStreamSynchronize.restype = ctypes.c_int
+        self._cudart.cudaDeviceSynchronize.argtypes = []
+        self._cudart.cudaDeviceSynchronize.restype = ctypes.c_int
 
         # Pre-expand vision position embedding across num_views (see
         # ``vision_encoder``'s patch embed path). Blackwell uses
@@ -296,6 +324,35 @@ class Pi05Pipeline:
         B["dec_act_fp8_large"] = CudaBuffer.device_zeros(ds * 2 * DEC_H, FP8)
         B["dec_act_scale"] = CudaBuffer.device_zeros(1, FP32)
 
+    def _allocate_int8_scratch(self) -> None:
+        """Allocate reusable INT8 activation scratch for the decoder path."""
+        if not self.use_int8_decoder:
+            return
+        B = self.bufs
+        ds = self.chunk_size
+        B["dec_act_int8"] = CudaBuffer.device_zeros(ds * DEC_D, INT8)
+        B["dec_act_int8_large"] = CudaBuffer.device_zeros(ds * 2 * DEC_H, INT8)
+
+    def _allocate_encoder_int8_scratch(self) -> None:
+        """Allocate reusable INT8 activation scratch for encoder + vision paths.
+
+        Vision runs before encoder and reuses these same buffers (sequential,
+        never concurrent). Vision shapes always fit within the encoder-sized
+        scratch (VIS_D=1152 < ENC_D=2048, VIS_H=4304 < ENC_H=16384).
+
+        Two sizes:
+          enc_act_int8       — (es * ENC_D) INT8: covers encoder QKV/O/gate_up
+                               and vision QKV/O/up (K ≤ ENC_D)
+          enc_act_int8_large — (es * ENC_H) INT8: covers encoder down
+                               and vision down (K ≤ ENC_H)
+        """
+        if not (self.use_int8_encoder or self.use_int8_vision):
+            return
+        B = self.bufs
+        es = self.encoder_seq_len
+        B["enc_act_int8"] = CudaBuffer.device_zeros(es * ENC_D, INT8)
+        B["enc_act_int8_large"] = CudaBuffer.device_zeros(es * ENC_H, INT8)
+
     # ══════════════════════════════════════════════════════════════════
     #   RoPE table
     # ══════════════════════════════════════════════════════════════════
@@ -367,6 +424,10 @@ class Pi05Pipeline:
     def _weight_fp8(self, name: str) -> tuple[int, int]:
         """Look up an FP8-quantized weight: returns (data_ptr, scale_ptr)."""
         return self.weights["fp8"][name]
+
+    def _weight_int8(self, name: str) -> tuple[int, int]:
+        """Look up an INT8-quantized weight: returns (data_ptr, scale_ptr)."""
+        return self.weights["int8"][name]
 
     def _upload_precomputed_styles(self) -> None:
         """Upload frontend-precomputed decoder style/time buffers.
@@ -461,6 +522,50 @@ class Pi05Pipeline:
         buf = small if act_n <= (small.nbytes // 1) else large
         return buf.ptr.value, scratch_scale.ptr.value
 
+    def _int8_scale_buf(self, name: str, rows: int) -> CudaBuffer:
+        """Get (lazy-allocate) the per-row INT8 activation scale buffer."""
+        buf = self.int8_act_scales.get(name)
+        if buf is None:
+            buf = CudaBuffer.device_zeros(rows, FP32)
+            self.int8_act_scales[name] = buf
+        elif (buf.nbytes // np.dtype(FP32).itemsize) < rows:
+            raise ValueError(
+                f"int8 scale buffer for {name} is too small: "
+                f"{buf.nbytes // np.dtype(FP32).itemsize} < {rows}")
+        return buf
+
+    def _pick_int8_scratch(self, act_n: int) -> int:
+        """Return the decoder INT8 scratch buffer large enough for ``act_n``."""
+        B = self.bufs
+        small = B["dec_act_int8"]
+        large = B["dec_act_int8_large"]
+        buf = small if act_n <= (small.nbytes // np.dtype(INT8).itemsize) else large
+        return buf.ptr.value
+
+    def _pick_enc_int8_scratch(self, act_n: int) -> int:
+        """Return the encoder INT8 scratch buffer large enough for ``act_n``."""
+        B = self.bufs
+        small = B["enc_act_int8"]
+        large = B["enc_act_int8_large"]
+        buf = small if act_n <= (small.nbytes // np.dtype(INT8).itemsize) else large
+        return buf.ptr.value
+
+    def _enc_int8_gemm(self, act_bf16_ptr: int, act_n: int, weight_name: str,
+                       out_bf16_ptr: int, M: int, N: int, K: int, stream: int) -> None:
+        """INT8 GEMM for the encoder: rowwise-quantize BF16 activation then CUTLASS.
+
+        Mirrors ``_int8_gemm`` but uses the larger encoder INT8 scratch
+        buffers so the decoder path's tiny (chunk=10) scratch is not
+        accidentally picked for encoder sequences (~560 rows).
+        """
+        act_i8_ptr = self._pick_enc_int8_scratch(act_n)
+        layer_scale = self._int8_scale_buf(weight_name, M)
+        self.fvk.quantize_int8_rowwise(
+            act_bf16_ptr, act_i8_ptr, layer_scale.ptr.value, M, K, stream=stream)
+        self._int8_gemm_fused(
+            act_i8_ptr, weight_name, out_bf16_ptr, M, N, K,
+            layer_scale.ptr.value, stream)
+
     def _fp8_gemm(self, act_bf16_ptr: int, act_n: int, weight_name: str,
                   out_bf16_ptr: int, M: int, N: int, K: int, stream: int) -> None:
         """FP8 GEMM path: dynamic-quantize activation → FP8 matmul → BF16 out.
@@ -500,6 +605,32 @@ class Pi05Pipeline:
         self.gemm.fp8_nn_dev(
             act_fp8_ptr, w_fp8_ptr, out_bf16_ptr,
             M, N, K, act_scale_ptr, w_scale_ptr, stream=stream)
+
+    def _int8_gemm_fused(self, act_i8_ptr: int, weight_name: str,
+                         out_bf16_ptr: int, M: int, N: int, K: int,
+                         act_scale_ptr: int, stream: int) -> None:
+        """INT8 GEMM with pre-quantized rowwise activation."""
+        fvk = self.fvk
+        w_i8_ptr, w_scale_ptr = self._weight_int8(weight_name)
+        status = fvk.cutlass_int8_rowwise_bf16out(
+            act_i8_ptr, w_i8_ptr, act_scale_ptr, w_scale_ptr,
+            out_bf16_ptr, M, N, K, stream=stream)
+        if status != 0:
+            raise RuntimeError(
+                f"CUTLASS INT8 fused GEMM failed for {weight_name}: "
+                f"status={status} shape=({M},{N},{K})")
+
+    def _int8_gemm(self, act_bf16_ptr: int, act_n: int, weight_name: str,
+                   out_bf16_ptr: int, M: int, N: int, K: int, stream: int) -> None:
+        """INT8 GEMM path: rowwise quantize activation -> fused CUTLASS BF16 out."""
+        fvk = self.fvk
+        act_i8_ptr = self._pick_int8_scratch(act_n)
+        layer_scale = self._int8_scale_buf(weight_name, M)
+        fvk.quantize_int8_rowwise(
+            act_bf16_ptr, act_i8_ptr, layer_scale.ptr.value, M, K, stream=stream)
+        self._int8_gemm_fused(
+            act_i8_ptr, weight_name, out_bf16_ptr, M, N, K,
+            layer_scale.ptr.value, stream)
 
     def _bias_add_bf16(self, x_ptr: int, bias_ptr: int,
                        seq: int, dim: int, stream: int) -> None:
@@ -570,6 +701,7 @@ class Pi05Pipeline:
         W = self.weights
         B = self.bufs
         attn_ptrs = self._attn_ptrs
+        use_int8_vis = self.use_int8_vision
 
         # Attention LayerNorm → x_norm
         fvk.layer_norm(
@@ -578,8 +710,15 @@ class Pi05Pipeline:
             B["vision_x_norm"].ptr.value,
             seq, VIS_D, 1e-5, stream=stream)
 
-        # QKV GEMM (FP8 or BF16) → vision_QKV
-        if use_fp8:
+        # QKV GEMM (INT8 / FP8 / BF16) → vision_QKV
+        if use_int8_vis:
+            # Reuses encoder INT8 scratch (vision shapes always fit).
+            self._enc_int8_gemm(
+                B["vision_x_norm"].ptr.value, seq * VIS_D,
+                f"vision_attn_qkv_w_{i}",
+                B["vision_QKV"].ptr.value,
+                seq, 3 * VIS_D, VIS_D, stream)
+        elif use_fp8:
             self._fp8_gemm(
                 B["vision_x_norm"].ptr.value, seq * VIS_D,
                 f"vision_attn_qkv_w_{i}",
@@ -590,9 +729,10 @@ class Pi05Pipeline:
                 B["vision_x_norm"].ptr.value, W["vision_attn_qkv_w"][i],
                 B["vision_QKV"].ptr.value,
                 seq, 3 * VIS_D, VIS_D, stream=stream)
-        self._bias_add_bf16(
+        # add_bias_bf16 is a proper in-place add (no zero-buffer bandwidth waste)
+        fvk.add_bias_bf16(
             B["vision_QKV"].ptr.value, W["vision_attn_qkv_b"][i],
-            seq, 3 * VIS_D, stream)
+            seq, 3 * VIS_D, stream=stream)
 
         # Split QKV into attn_backend's Q/K/V buffers
         fvk.qkv_split(
@@ -600,16 +740,18 @@ class Pi05Pipeline:
             attn_ptrs["vis_Q"], attn_ptrs["vis_K"], attn_ptrs["vis_V"],
             seq, VIS_D, VIS_D, VIS_D, stream=stream)
 
-        # Self-attention (per-view batched). Backend returns the output
-        # pointer directly — no copy into a pre-allocated O buffer.
-        # Dispatch attention through the AttentionBackend protocol
-        # (``run("siglip", layer, q_seq)``). Identical kernel call
-        # under the hood as the legacy ``vision_attn()`` method.
+        # Self-attention (per-view batched)
         vis_o_ptr = self.attn.run(
             "siglip", i, q_seq=VIS_SEQ_PER_VIEW, stream=stream)
 
         # Attn output projection → x_norm
-        if use_fp8:
+        if use_int8_vis:
+            self._enc_int8_gemm(
+                vis_o_ptr, seq * VIS_D,
+                f"vision_attn_o_w_{i}",
+                B["vision_x_norm"].ptr.value,
+                seq, VIS_D, VIS_D, stream)
+        elif use_fp8:
             self._fp8_gemm(
                 vis_o_ptr, seq * VIS_D,
                 f"vision_attn_o_w_{i}",
@@ -633,7 +775,13 @@ class Pi05Pipeline:
             seq, VIS_D, 1e-5, stream=stream)
 
         # FFN up → hidden, + bias, + GELU
-        if use_fp8:
+        if use_int8_vis:
+            self._enc_int8_gemm(
+                B["vision_x_norm"].ptr.value, seq * VIS_D,
+                f"vision_ffn_up_w_{i}",
+                B["vision_hidden"].ptr.value,
+                seq, VIS_H, VIS_D, stream)
+        elif use_fp8:
             self._fp8_gemm(
                 B["vision_x_norm"].ptr.value, seq * VIS_D,
                 f"vision_ffn_up_w_{i}",
@@ -644,13 +792,19 @@ class Pi05Pipeline:
                 B["vision_x_norm"].ptr.value, W["vision_ffn_up_w"][i],
                 B["vision_hidden"].ptr.value,
                 seq, VIS_H, VIS_D, stream=stream)
-        self._bias_add_bf16(
+        fvk.add_bias_bf16(
             B["vision_hidden"].ptr.value, W["vision_ffn_up_b"][i],
-            seq, VIS_H, stream)
+            seq, VIS_H, stream=stream)
         fvk.gelu_inplace(B["vision_hidden"].ptr.value, seq * VIS_H, stream=stream)
 
         # FFN down → x_norm, then x += x_norm + down_bias
-        if use_fp8:
+        if use_int8_vis:
+            self._enc_int8_gemm(
+                B["vision_hidden"].ptr.value, seq * VIS_H,
+                f"vision_ffn_down_w_{i}",
+                B["vision_x_norm"].ptr.value,
+                seq, VIS_D, VIS_H, stream)
+        elif use_fp8:
             self._fp8_gemm(
                 B["vision_hidden"].ptr.value, seq * VIS_H,
                 f"vision_ffn_down_w_{i}",
@@ -701,9 +855,9 @@ class Pi05Pipeline:
                 B["vision_x_norm"].ptr.value, W["encoder_multi_modal_projector_w"],
                 B["encoder_x"].ptr.value,
                 vs, ENC_D, VIS_D, stream=stream)
-        self._bias_add_bf16(
+        fvk.add_bias_bf16(
             B["encoder_x"].ptr.value, W["encoder_multi_modal_projector_b"],
-            vs, ENC_D, stream)
+            vs, ENC_D, stream=stream)
 
         # Language embeds have been written by frontend into encoder_x[vs:vs+lang_len]
 
@@ -720,9 +874,24 @@ class Pi05Pipeline:
         B = self.bufs
         attn_ptrs = self._attn_ptrs
         fused = self.use_fp8 and self.fp8_calibrated
+        use_int8_enc = self.use_int8_encoder
 
         # B1: RMSNorm → QKV GEMM
-        if fused:
+        if use_int8_enc:
+            # Fused RMSNorm → INT8 (one global-memory pass, no intermediate BF16)
+            qkv_name = f"encoder_attn_qkv_w_{i}"
+            layer_scale_qkv = self._int8_scale_buf(qkv_name, seq)
+            act_i8_ptr = self._pick_enc_int8_scratch(seq * ENC_D)
+            fvk.rms_norm_int8_rowwise(
+                B["encoder_x"].ptr.value, self._rms_ones_enc.ptr.value,
+                act_i8_ptr, layer_scale_qkv.ptr.value,
+                seq, ENC_D, 1e-6, stream=stream)
+            self._int8_gemm_fused(
+                act_i8_ptr, qkv_name,
+                B["encoder_QKV"].ptr.value,
+                seq, (ENC_NH + 2 * ENC_NKV) * ENC_HD, ENC_D,
+                layer_scale_qkv.ptr.value, stream)
+        elif fused:
             qkv_name = f"encoder_attn_qkv_w_{i}"
             act_scale_ptr = self.fp8_act_scales[qkv_name].ptr.value
             if fuse_b1:
@@ -779,14 +948,16 @@ class Pi05Pipeline:
             return
 
         # B2: Attention (GQA) — returns output pointer (no copy).
-        # Stage 2a of upstream refactor: migrated from legacy
-        # ``encoder_attn(layer, seq)`` to AttentionBackend protocol's
-        # ``run("encoder", layer, q_seq=seq)``. Same flash_attn call
-        # under the hood.
         enc_o_ptr = self.attn.run("encoder", i, q_seq=seq, stream=stream)
 
         # B3: Attn output projection → x_norm
-        if self.use_fp8:
+        if use_int8_enc:
+            self._enc_int8_gemm(
+                enc_o_ptr, seq * ENC_D,
+                f"encoder_attn_o_w_{i}",
+                B["encoder_x_norm"].ptr.value,
+                seq, ENC_D, ENC_D, stream)
+        elif self.use_fp8:
             self._fp8_gemm(
                 enc_o_ptr, seq * ENC_D,
                 f"encoder_attn_o_w_{i}",
@@ -798,8 +969,24 @@ class Pi05Pipeline:
                 B["encoder_x_norm"].ptr.value,
                 seq, ENC_D, ENC_D, stream=stream)
 
-        # B4: RMSNorm → FFN gate+up
-        if fused:
+        # B4: (residual_add + RMSNorm) fused → INT8 gate_up GEMM
+        if use_int8_enc:
+            # Fused: x += x_norm (attn_o); RMSNorm(x) → INT8 for gate_up.
+            # Saves 2 extra BW passes vs separate residual_add+rms_norm+quantize.
+            gu_name = f"encoder_ffn_gate_up_w_{i}"
+            layer_scale_gu = self._int8_scale_buf(gu_name, seq)
+            act_i8_ptr = self._pick_enc_int8_scratch(seq * ENC_D)
+            fvk.residual_add_rms_norm_int8_rowwise(
+                B["encoder_x"].ptr.value, B["encoder_x_norm"].ptr.value,
+                self._rms_ones_enc.ptr.value,
+                act_i8_ptr, layer_scale_gu.ptr.value,
+                seq, ENC_D, 1e-6, stream=stream)
+            self._int8_gemm_fused(
+                act_i8_ptr, gu_name,
+                B["encoder_gate_merged"].ptr.value,
+                seq, 2 * ENC_H, ENC_D,
+                layer_scale_gu.ptr.value, stream)
+        elif fused:
             # Fused: residual + RMS → FP8 in one kernel, then FP8 GEMM
             gu_name = f"encoder_ffn_gate_up_w_{i}"
             act_scale_gu = self.fp8_act_scales[gu_name].ptr.value
@@ -844,8 +1031,18 @@ class Pi05Pipeline:
                 B["encoder_hidden"].ptr.value,
                 seq, ENC_H, ENC_D, stream=stream)
 
-        # SiLU(gate) * up → hidden (or FP8)
-        if fused:
+        # SiLU(gate) * up → hidden, then FFN down
+        if use_int8_enc:
+            fvk.gate_geglu_merged(
+                B["encoder_gate_merged"].ptr.value,
+                B["encoder_hidden"].ptr.value,
+                seq, ENC_H, stream=stream)
+            self._enc_int8_gemm(
+                B["encoder_hidden"].ptr.value, seq * ENC_H,
+                f"encoder_ffn_down_w_{i}",
+                B["encoder_x_norm"].ptr.value,
+                seq, ENC_D, ENC_H, stream)
+        elif fused:
             down_name = f"encoder_ffn_down_w_{i}"
             act_scale_down = self.fp8_act_scales[down_name].ptr.value
             fvk.gate_geglu_merged_fp8(
@@ -910,7 +1107,7 @@ class Pi05Pipeline:
 
             # 18 decoder layers
             for i in range(DEC_L):
-                skip_c1 = fused and i > 0
+                skip_c1 = (fused or self.use_int8_decoder) and i > 0
                 self._decoder_layer(i, step, enc_seq, ds, skip_c1, stream)
 
             # C8: Final AdaRMSNorm + output projection
@@ -960,17 +1157,33 @@ class Pi05Pipeline:
                 ds, (DEC_NH + 2 * DEC_NKV) * DEC_HD, DEC_D,
                 act_scale_qkv, stream)
         else:
-            fvk.ada_rms_norm_style(
-                B["decoder_x"].ptr.value, self._rms_ones_dec.ptr.value,
-                self._style_slice_ptr("decoder_style_attn", step, i),
-                B["x_normed_buf"].ptr.value, B["gate_buf"].ptr.value,
-                ds, DEC_D, 1e-6, stream=stream)
+            if self.use_int8_decoder:
+                act_i8_ptr = B["dec_act_int8"].ptr.value
+                act_scale_qkv = self._int8_scale_buf(qkv_name, ds).ptr.value
+                if not skip_c1:
+                    fvk.ada_rms_norm_style_int8(
+                        B["decoder_x"].ptr.value, self._rms_ones_dec.ptr.value,
+                        self._style_slice_ptr("decoder_style_attn", step, i),
+                        act_i8_ptr, B["gate_buf"].ptr.value,
+                        ds, DEC_D, 1e-6, act_scale_qkv, stream=stream)
+            else:
+                fvk.ada_rms_norm_style(
+                    B["decoder_x"].ptr.value, self._rms_ones_dec.ptr.value,
+                    self._style_slice_ptr("decoder_style_attn", step, i),
+                    B["x_normed_buf"].ptr.value, B["gate_buf"].ptr.value,
+                    ds, DEC_D, 1e-6, stream=stream)
             if self.use_fp8_decoder:
                 self._fp8_gemm(
                     B["x_normed_buf"].ptr.value, ds * DEC_D,
                     qkv_name,
                     B["decoder_QKV"].ptr.value,
                     ds, (DEC_NH + 2 * DEC_NKV) * DEC_HD, DEC_D, stream)
+            elif self.use_int8_decoder:
+                self._int8_gemm_fused(
+                    B["dec_act_int8"].ptr.value, qkv_name,
+                    B["decoder_QKV"].ptr.value,
+                    ds, (DEC_NH + 2 * DEC_NKV) * DEC_HD, DEC_D,
+                    self._int8_scale_buf(qkv_name, ds).ptr.value, stream)
             else:
                 gemm.bf16_nn(
                     B["x_normed_buf"].ptr.value, W["decoder_attn_qkv_w"][i],
@@ -1009,6 +1222,12 @@ class Pi05Pipeline:
                 f"decoder_attn_o_w_{i}",
                 B["x_normed_buf"].ptr.value,
                 ds, DEC_D, DEC_NH * DEC_HD, stream)
+        elif self.use_int8_decoder:
+            self._int8_gemm(
+                dec_o_ptr, ds * DEC_NH * DEC_HD,
+                f"decoder_attn_o_w_{i}",
+                B["x_normed_buf"].ptr.value,
+                ds, DEC_D, DEC_NH * DEC_HD, stream)
         else:
             gemm.bf16_nn(
                 dec_o_ptr, W["decoder_attn_o_w"][i],
@@ -1031,20 +1250,37 @@ class Pi05Pipeline:
                 B["decoder_gate_merged"].ptr.value,
                 ds, 2 * DEC_H, DEC_D, act_scale_gu, stream)
         else:
-            fvk.gate_mul_residual(
-                B["decoder_x"].ptr.value, B["x_normed_buf"].ptr.value,
-                B["gate_buf"].ptr.value, ds * DEC_D, stream=stream)
-            fvk.ada_rms_norm_style(
-                B["decoder_x"].ptr.value, self._rms_ones_dec.ptr.value,
-                self._style_slice_ptr("decoder_style_ffn", step, i),
-                B["x_normed_buf"].ptr.value, B["gate_buf"].ptr.value,
-                ds, DEC_D, 1e-6, stream=stream)
+            if self.use_int8_decoder:
+                act_i8_ptr = B["dec_act_int8"].ptr.value
+                act_scale_gu = self._int8_scale_buf(gu_name, ds).ptr.value
+                fvk.gate_residual_ada_norm_int8(
+                    B["decoder_x"].ptr.value, B["x_normed_buf"].ptr.value,
+                    B["gate_buf"].ptr.value,
+                    self._rms_ones_dec.ptr.value,
+                    self._style_slice_ptr("decoder_style_ffn", step, i),
+                    act_i8_ptr, B["gate_buf"].ptr.value,
+                    ds, DEC_D, 1e-6, act_scale_gu, stream=stream)
+            else:
+                fvk.gate_mul_residual(
+                    B["decoder_x"].ptr.value, B["x_normed_buf"].ptr.value,
+                    B["gate_buf"].ptr.value, ds * DEC_D, stream=stream)
+                fvk.ada_rms_norm_style(
+                    B["decoder_x"].ptr.value, self._rms_ones_dec.ptr.value,
+                    self._style_slice_ptr("decoder_style_ffn", step, i),
+                    B["x_normed_buf"].ptr.value, B["gate_buf"].ptr.value,
+                    ds, DEC_D, 1e-6, stream=stream)
             if self.use_fp8_decoder:
                 self._fp8_gemm(
                     B["x_normed_buf"].ptr.value, ds * DEC_D,
                     gu_name,
                     B["decoder_gate_merged"].ptr.value,
                     ds, 2 * DEC_H, DEC_D, stream)
+            elif self.use_int8_decoder:
+                self._int8_gemm_fused(
+                    B["dec_act_int8"].ptr.value, gu_name,
+                    B["decoder_gate_merged"].ptr.value,
+                    ds, 2 * DEC_H, DEC_D,
+                    self._int8_scale_buf(gu_name, ds).ptr.value, stream)
             else:
                 gemm.bf16_nn(
                     B["x_normed_buf"].ptr.value, W["decoder_ffn_gate_w"][i],
@@ -1077,6 +1313,16 @@ class Pi05Pipeline:
                 down_name,
                 B["x_normed_buf"].ptr.value,
                 ds, DEC_D, DEC_H, stream)
+        elif self.use_int8_decoder:
+            fvk.gate_geglu_merged(
+                B["decoder_gate_merged"].ptr.value,
+                B["decoder_hidden"].ptr.value,
+                ds, DEC_H, stream=stream)
+            self._int8_gemm(
+                B["decoder_hidden"].ptr.value, ds * DEC_H,
+                down_name,
+                B["x_normed_buf"].ptr.value,
+                ds, DEC_D, DEC_H, stream)
         else:
             fvk.gate_geglu(
                 B["decoder_gate_merged"].ptr.value,
@@ -1098,6 +1344,16 @@ class Pi05Pipeline:
                 self._rms_ones_dec.ptr.value,
                 self._style_slice_ptr("decoder_style_attn", step, i + 1),
                 B["dec_act_fp8"].ptr.value, B["gate_buf"].ptr.value,
+                ds, DEC_D, 1e-6, act_scale_next, stream=stream)
+        elif self.use_int8_decoder and i < DEC_L - 1:
+            next_qkv = f"decoder_attn_qkv_w_{i + 1}"
+            act_scale_next = self._int8_scale_buf(next_qkv, ds).ptr.value
+            fvk.gate_residual_ada_norm_int8(
+                B["decoder_x"].ptr.value, B["x_normed_buf"].ptr.value,
+                B["gate_buf"].ptr.value,
+                self._rms_ones_dec.ptr.value,
+                self._style_slice_ptr("decoder_style_attn", step, i + 1),
+                B["dec_act_int8"].ptr.value, B["gate_buf"].ptr.value,
                 ds, DEC_D, 1e-6, act_scale_next, stream=stream)
         else:
             fvk.gate_mul_residual(
@@ -1170,6 +1426,29 @@ class Pi05Pipeline:
             B["vision_x"].ptr.value,
             vs, VIS_D, VIS_PATCH_FLAT)
 
+        # Vision BF16 attention + FFN shapes (when FP8 and INT8 are both
+        # disabled, e.g. Orin SM87).  Autotuning picks the best cuBLASLt
+        # algorithm for each shape; all 27 layers share these 5 shapes so
+        # one autotune run covers the entire SigLIP stack.
+        # Output buffers must be large enough for each shape's output.
+        if not self.use_fp8 and not self.use_int8_vision:
+            for M_val, N_val, K_val, act_key, out_key, weight_ptr in [
+                (vs, 3 * VIS_D, VIS_D, "vision_x_norm", "vision_QKV",
+                 W["vision_attn_qkv_w"][0]),
+                (vs, VIS_D,     VIS_D, "vision_x_norm", "vision_x_norm",
+                 W["vision_attn_o_w"][0]),
+                (vs, VIS_H,     VIS_D, "vision_x_norm", "vision_hidden",
+                 W["vision_ffn_up_w"][0]),
+                (vs, VIS_D,     VIS_H, "vision_hidden",  "vision_x_norm",
+                 W["vision_ffn_down_w"][0]),
+                (vs, ENC_D,     VIS_D, "vision_x_norm",  "encoder_x",
+                 W["encoder_multi_modal_projector_w"]),
+            ]:
+                gemm.autotune_bf16_nn(
+                    B[act_key].ptr.value, weight_ptr,
+                    B[out_key].ptr.value,
+                    M_val, N_val, K_val)
+
         # Vision FP8 shapes
         if self.use_fp8 and self.fp8_calibrated and "vision_attn_qkv_w_0" in self.weights.get("fp8", {}):
             for name_prefix, M_val, N_val, K_val, out_key in [
@@ -1218,6 +1497,10 @@ class Pi05Pipeline:
                 gemm.autotune_fp8_nn_dev(
                     act_buf.ptr.value, w_fp8_ptr, B[out_key].ptr.value,
                     M_val, N_val, K_val, act_scale_ptr, w_scale_ptr)
+
+        if self.use_int8_decoder and "decoder_attn_qkv_w_0" in self.weights.get("int8", {}):
+            logger.info(
+                "Skipping cuBLASLt INT8 autotune: decoder INT8 uses CUTLASS fused path")
 
         self._cudart.cudaDeviceSynchronize()
         logger.info("Autotune complete")

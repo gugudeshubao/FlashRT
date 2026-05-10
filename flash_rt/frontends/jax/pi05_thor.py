@@ -81,12 +81,10 @@ class Pi05JaxFrontendThor:
 
         # ── Load norm stats (openpi or lerobot HF release) ──
         from flash_rt.core.utils.norm_stats import (
-            load_norm_stats, lerobot_candidates,
+            load_norm_stats, pi05_candidates,
         )
         self.norm_stats = load_norm_stats(
-            [checkpoint_dir / "assets" / "physical-intelligence" / "libero" / "norm_stats.json",
-             checkpoint_dir / "norm_stats.json",
-             *lerobot_candidates(checkpoint_dir)],
+            pi05_candidates(checkpoint_dir),
             checkpoint_dir=checkpoint_dir,
             strict=False,
         )

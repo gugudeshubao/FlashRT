@@ -36,6 +36,19 @@ void quantize_fp8_static_fp16(const __half* input, __nv_fp8_e4m3* output,
 void quantize_fp8_device_fp16(const __half* input, __nv_fp8_e4m3* output,
                                float* d_scale, int n, cudaStream_t stream = 0);
 
+// ── INT8 (BF16 activations, device-only dynamic scale) ──
+
+void quantize_int8_device(const __nv_bfloat16* input, int8_t* output,
+                          float* d_scale, int n, cudaStream_t stream = 0);
+
+void quantize_int8_rowwise(const __nv_bfloat16* input, int8_t* output,
+                           float* d_scales, int rows, int cols,
+                           cudaStream_t stream = 0);
+
+void dequant_int32_to_bf16(const int32_t* input, __nv_bfloat16* output,
+                           const float* d_act_scale, const float* d_weight_scale,
+                           int n, cudaStream_t stream = 0);
+
 // ── L2 weight prefetch ──
 
 void prefetch_l2(const void* data, size_t num_bytes, cudaStream_t stream = 0);

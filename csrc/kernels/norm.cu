@@ -229,6 +229,81 @@ void ada_rms_norm_style(const __nv_bfloat16* x, const __nv_bfloat16* weight,
         x, weight, style, out, gate_out, dim, eps);
 }
 
+template<typename T>
+__global__ void ada_rms_norm_style_int8_kernel(
+    const T* __restrict__ x, const T* __restrict__ weight,
+    const T* __restrict__ style, int8_t* __restrict__ out, T* __restrict__ gate_out,
+    int dim, float eps, float* __restrict__ d_scales) {
+    using T2 = typename packed2<T>::type;
+    int row = blockIdx.x;
+    const T2* x2 = reinterpret_cast<const T2*>(x + row * dim);
+    const T* style_row = style + row * 3 * dim;
+    const T2* sc2 = reinterpret_cast<const T2*>(style_row);
+    const T2* sh2 = reinterpret_cast<const T2*>(style_row + dim);
+    const T2* gt2 = reinterpret_cast<const T2*>(style_row + 2 * dim);
+    const T2* w2 = reinterpret_cast<const T2*>(weight);
+    T2* gate2 = reinterpret_cast<T2*>(gate_out + row * dim);
+    int8_t* out_row = out + row * dim;
+    int dim2 = dim >> 1;
+
+    extern __shared__ float shared[];
+    float local_sum = 0.0f;
+    float local_amax = 0.0f;
+    for (int i = threadIdx.x; i < dim2; i += blockDim.x) {
+        T2 val = x2[i];
+        float v0 = to_f32(val.x), v1 = to_f32(val.y);
+        local_sum += v0 * v0 + v1 * v1;
+    }
+    float rms = rsqrtf(block_reduce_sum(local_sum, shared) / dim + eps);
+
+    for (int i = threadIdx.x; i < dim2; i += blockDim.x) {
+        T2 xv = x2[i], wv = w2[i];
+        T2 sv = sc2[i], hv = sh2[i];
+        float n0 = to_f32(xv.x) * rms * to_f32(wv.x);
+        float n1 = to_f32(xv.y) * rms * to_f32(wv.y);
+        float val0 = n0 * (1.0f + to_f32(sv.x)) + to_f32(hv.x);
+        float val1 = n1 * (1.0f + to_f32(sv.y)) + to_f32(hv.y);
+        local_amax = fmaxf(local_amax, fabsf(val0));
+        local_amax = fmaxf(local_amax, fabsf(val1));
+    }
+    float amax = block_reduce_max(local_amax, shared);
+    __shared__ float scale_s;
+    if (threadIdx.x == 0) {
+        float s = fmaxf(amax / 127.0f, 1e-10f);
+        d_scales[row] = s;
+        scale_s = s;
+    }
+    __syncthreads();
+    float inv_scale = 1.0f / scale_s;
+
+    for (int i = threadIdx.x; i < dim2; i += blockDim.x) {
+        T2 xv = x2[i], wv = w2[i];
+        T2 sv = sc2[i], hv = sh2[i], gv = gt2[i];
+        float n0 = to_f32(xv.x) * rms * to_f32(wv.x);
+        float n1 = to_f32(xv.y) * rms * to_f32(wv.y);
+        float val0 = (n0 * (1.0f + to_f32(sv.x)) + to_f32(hv.x)) * inv_scale;
+        float val1 = (n1 * (1.0f + to_f32(sv.y)) + to_f32(hv.y)) * inv_scale;
+        int q0 = __float2int_rn(val0);
+        int q1 = __float2int_rn(val1);
+        out_row[2 * i] = static_cast<int8_t>((q0 < -127) ? -127 : ((q0 > 127) ? 127 : q0));
+        out_row[2 * i + 1] = static_cast<int8_t>((q1 < -127) ? -127 : ((q1 > 127) ? 127 : q1));
+        gate2[i] = gv;
+    }
+}
+
+FVK_KERNEL_INSTANTIATE(__global__ void ada_rms_norm_style_int8_kernel<__half>(
+    const __half*, const __half*, const __half*, int8_t*, __half*, int, float, float*))
+FVK_KERNEL_INSTANTIATE(__global__ void ada_rms_norm_style_int8_kernel<__nv_bfloat16>(
+    const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*, int8_t*, __nv_bfloat16*, int, float, float*))
+void ada_rms_norm_style_int8(const __nv_bfloat16* x, const __nv_bfloat16* weight,
+                             const __nv_bfloat16* style,
+                             int8_t* out, __nv_bfloat16* gate_out,
+                             int seq_len, int dim, float eps,
+                             float* d_scales, cudaStream_t stream) {
+    ada_rms_norm_style_int8_kernel<__nv_bfloat16><<<seq_len, 256, 256 * sizeof(float), stream>>>(
+        x, weight, style, out, gate_out, dim, eps, d_scales);
+}
+
 // ── RMSNorm → FP8 ──
 template<typename T>
 __global__ void rms_norm_fp8_kernel(const T* __restrict__ x,
@@ -898,4 +973,128 @@ void ada_layer_norm_fp16(const __half* x, const __half* scale, const __half* shi
                           cudaStream_t stream) {
     ada_layer_norm_fp16_kernel<<<seq_len, 256, 256 * sizeof(float), stream>>>(
         x, scale, shift, out, dim, eps);
+}
+
+// ── Fused RMSNorm → INT8 (per-row dynamic scale) ──
+//
+// Avoids the intermediate BF16 write that the separate
+// rms_norm + quantize_int8_rowwise pair requires.  Each block
+// handles one row; shared memory holds the float-converted values
+// so the data is only loaded from global memory once.
+//
+// smem layout: [0..cols-1] float data; [cols..cols+31] warp partials.
+// Launch: grid=(seq_len,), block=(256,), smem=(cols+32)*sizeof(float)
+__global__ void rms_norm_int8_rowwise_kernel(
+        const __nv_bfloat16* __restrict__ x,
+        const __nv_bfloat16* __restrict__ weight,
+        int8_t*  __restrict__ out,
+        float*   __restrict__ scales,
+        int rows, int cols, float eps) {
+    extern __shared__ float smem[];
+    float* partial = smem + cols;
+
+    int row = blockIdx.x;
+    if (row >= rows) return;
+
+    const __nv_bfloat16* xr = x + (int64_t)row * cols;
+    int8_t* outr = out + (int64_t)row * cols;
+
+    // Pass 1: load x → smem, accumulate sum of squares
+    float sum_sq = 0.f;
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+        float xi = __bfloat162float(xr[i]);
+        smem[i] = xi;
+        sum_sq += xi * xi;
+    }
+    float rms = rsqrtf(block_reduce_sum(sum_sq, partial) / cols + eps);
+
+    // Pass 2: normalize (reuse smem), accumulate max_abs
+    float max_abs = 0.f;
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+        float v = smem[i] * rms * __bfloat162float(weight[i]);
+        smem[i] = v;
+        max_abs = fmaxf(max_abs, fabsf(v));
+    }
+    float scale = fmaxf(block_reduce_max(max_abs, partial) / 127.f, 1e-12f);
+    if (threadIdx.x == 0) scales[row] = scale;
+    float inv_s = 1.f / scale;
+
+    // Pass 3: write INT8
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+        float v = smem[i] * inv_s;
+        outr[i] = (int8_t)__float2int_rn(fmaxf(-127.f, fminf(127.f, v)));
+    }
+}
+
+void rms_norm_int8_rowwise(const __nv_bfloat16* x,
+                            const __nv_bfloat16* weight,
+                            int8_t* out, float* scales,
+                            int seq_len, int dim, float eps,
+                            cudaStream_t stream) {
+    int smem = (dim + 32) * sizeof(float);
+    rms_norm_int8_rowwise_kernel<<<seq_len, 256, smem, stream>>>(
+        x, weight, out, scales, seq_len, dim, eps);
+}
+
+// ── Fused residual-add + RMSNorm → INT8 (per-row dynamic scale) ──
+//
+// Fuses three operations that appear at encoder B4:
+//   residual += x_norm
+//   normed    = RMSNorm(residual, weight)
+//   out_i8    = INT8_quantize_rowwise(normed)
+// into a single kernel pass over global memory.
+__global__ void residual_add_rms_norm_int8_rowwise_kernel(
+        __nv_bfloat16* __restrict__ residual,
+        const __nv_bfloat16* __restrict__ x,
+        const __nv_bfloat16* __restrict__ weight,
+        int8_t* __restrict__ out,
+        float*  __restrict__ scales,
+        int rows, int cols, float eps) {
+    extern __shared__ float smem[];
+    float* partial = smem + cols;
+
+    int row = blockIdx.x;
+    if (row >= rows) return;
+
+    __nv_bfloat16* res_row = residual + (int64_t)row * cols;
+    const __nv_bfloat16* x_row = x + (int64_t)row * cols;
+    int8_t* out_row = out + (int64_t)row * cols;
+
+    // Pass 1: residual += x, load into smem, accumulate sum_sq
+    float sum_sq = 0.f;
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+        float ri = __bfloat162float(res_row[i]) + __bfloat162float(x_row[i]);
+        res_row[i] = __float2bfloat16(ri);
+        smem[i] = ri;
+        sum_sq += ri * ri;
+    }
+    float rms = rsqrtf(block_reduce_sum(sum_sq, partial) / cols + eps);
+
+    // Pass 2: normalize, accumulate max_abs
+    float max_abs = 0.f;
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+        float v = smem[i] * rms * __bfloat162float(weight[i]);
+        smem[i] = v;
+        max_abs = fmaxf(max_abs, fabsf(v));
+    }
+    float scale = fmaxf(block_reduce_max(max_abs, partial) / 127.f, 1e-12f);
+    if (threadIdx.x == 0) scales[row] = scale;
+    float inv_s = 1.f / scale;
+
+    // Pass 3: write INT8
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+        float v = smem[i] * inv_s;
+        out_row[i] = (int8_t)__float2int_rn(fmaxf(-127.f, fminf(127.f, v)));
+    }
+}
+
+void residual_add_rms_norm_int8_rowwise(
+        __nv_bfloat16* residual, const __nv_bfloat16* x,
+        const __nv_bfloat16* weight,
+        int8_t* out, float* scales,
+        int seq_len, int dim, float eps,
+        cudaStream_t stream) {
+    int smem = (dim + 32) * sizeof(float);
+    residual_add_rms_norm_int8_rowwise_kernel<<<seq_len, 256, smem, stream>>>(
+        residual, x, weight, out, scales, seq_len, dim, eps);
 }

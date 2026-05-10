@@ -52,6 +52,12 @@ void ada_rms_norm_style(const __nv_bfloat16* x, const __nv_bfloat16* weight,
                         int seq_len, int dim, float eps,
                         cudaStream_t stream = 0);
 
+void ada_rms_norm_style_int8(const __nv_bfloat16* x, const __nv_bfloat16* weight,
+                             const __nv_bfloat16* style,
+                             int8_t* out, __nv_bfloat16* gate_out,
+                             int seq_len, int dim, float eps,
+                             float* d_scales, cudaStream_t stream = 0);
+
 // ── Fused Norm → FP8 (with scale) ──
 
 void rms_norm_fp8_fp16(const __half* x, const __half* weight,
@@ -109,6 +115,27 @@ void residual_add_rms_norm_fp8_noweight_bf16(__nv_bfloat16* residual, const __nv
                                                int seq_len, int dim,
                                                const float* d_scale,
                                                cudaStream_t stream = 0);
+
+// ── Fused RMSNorm → INT8 rowwise (Orin encoder hot-path) ──
+
+// RMSNorm(x, weight) → INT8 with per-row dynamic scales.
+// Saves the intermediate BF16 write that separate rms_norm +
+// quantize_int8_rowwise requires.
+void rms_norm_int8_rowwise(const __nv_bfloat16* x,
+                            const __nv_bfloat16* weight,
+                            int8_t* out, float* scales,
+                            int seq_len, int dim, float eps,
+                            cudaStream_t stream = 0);
+
+// Fused residual += x; RMSNorm(residual, weight) → INT8 per-row.
+// Combines the B4 residual_add + rms_norm + quantize_int8_rowwise
+// triple into a single kernel pass.
+void residual_add_rms_norm_int8_rowwise(
+        __nv_bfloat16* residual, const __nv_bfloat16* x,
+        const __nv_bfloat16* weight,
+        int8_t* out, float* scales,
+        int seq_len, int dim, float eps,
+        cudaStream_t stream = 0);
 
 // ── Production-exact kernels (no weight, no scale) ──
 
