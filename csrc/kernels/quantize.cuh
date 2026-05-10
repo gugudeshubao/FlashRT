@@ -41,6 +41,10 @@ void quantize_fp8_device_fp16(const __half* input, __nv_fp8_e4m3* output,
 void quantize_int8_device(const __nv_bfloat16* input, int8_t* output,
                           float* d_scale, int n, cudaStream_t stream = 0);
 
+// Static INT8: uses pre-calibrated d_scale, no amax reduction (1 kernel vs 3).
+void quantize_int8_static(const __nv_bfloat16* input, int8_t* output,
+                           const float* d_scale, int n, cudaStream_t stream = 0);
+
 void quantize_int8_rowwise(const __nv_bfloat16* input, int8_t* output,
                            float* d_scales, int rows, int cols,
                            cudaStream_t stream = 0);

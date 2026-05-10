@@ -248,6 +248,21 @@ void quantize_int8_device(const __nv_bfloat16* input, int8_t* output,
         input, output, d_scale, n);
 }
 
+// ── Static INT8 quantization (pre-calibrated scale, no amax reduction) ──
+//
+// Drop-in replacement for quantize_int8_device when d_scale has already
+// been calibrated offline. Skips the 2-kernel amax+scale pass and runs
+// only the element-wise quantize kernel → 1 launch vs 3.
+// CUDA Graph compatible (all ops are pure device-side).
+void quantize_int8_static(const __nv_bfloat16* input, int8_t* output,
+                           const float* d_scale, int n, cudaStream_t stream) {
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    if (blocks > 65535) blocks = 65535;
+    quantize_int8_kernel_generic<__nv_bfloat16><<<blocks, threads, 0, stream>>>(
+        input, output, d_scale, n);
+}
+
 __global__ void quantize_int8_rowwise_kernel(
     const __nv_bfloat16* __restrict__ input,
     int8_t* __restrict__ output,

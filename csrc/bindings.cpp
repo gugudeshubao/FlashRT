@@ -931,6 +931,15 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
                                   reinterpret_cast<const float*>(d_scale), n, to_stream(stream));
     }, py::arg("input"), py::arg("output"), py::arg("d_scale"), py::arg("n"), py::arg("stream") = 0);
 
+    m.def("quantize_int8_static", [](uintptr_t input, uintptr_t output,
+                                      uintptr_t scale, int n, uintptr_t stream) {
+        quantize_int8_static(reinterpret_cast<const __nv_bfloat16*>(input),
+                             typed_ptr<int8_t>(output),
+                             reinterpret_cast<const float*>(scale),
+                             n, to_stream(stream));
+    }, py::arg("input"), py::arg("output"), py::arg("scale"),
+       py::arg("n"), py::arg("stream") = 0);
+
     m.def("quantize_int8_device", [](uintptr_t input, uintptr_t output,
                                       uintptr_t d_scale, int n, uintptr_t stream) {
         quantize_int8_device(reinterpret_cast<const __nv_bfloat16*>(input),

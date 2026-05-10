@@ -157,6 +157,7 @@ class Pi05Pipeline:
                  use_int8_decoder: bool = False,
                  use_int8_encoder: bool = False,
                  use_int8_vision: bool = False,
+                 use_int8_vision_static: bool = False,
                  vision_pool_factor: int = 1,
                  vision_num_layers: int = VIS_L,
                  num_steps: int = NUM_STEPS_DEFAULT):
@@ -174,6 +175,12 @@ class Pi05Pipeline:
         self.use_int8_decoder = bool(use_int8_decoder)
         self.use_int8_encoder = bool(use_int8_encoder)
         self.use_int8_vision = bool(use_int8_vision)
+        # Static INT8 vision: uses pre-calibrated per-layer per-tensor scales.
+        # Eliminates the per-row amax reduction → 1 quantize kernel vs 3.
+        # Scales are collected once during calibrate_int8_vision_static().
+        self.use_int8_vision_static = bool(use_int8_vision_static)
+        self.vis_int8_static_scales: dict = {}   # name → CudaBuffer(1, FP32)
+        self.vis_int8_static_calibrated = False
         self.vision_pool_factor = int(vision_pool_factor)
         self.vision_num_layers = int(vision_num_layers)
 
@@ -213,6 +220,7 @@ class Pi05Pipeline:
         self.int8_act_scales = {}  # name -> CudaBuffer(rows, fp32), runtime-dynamic
         self._allocate_int8_scratch()
         self._allocate_encoder_int8_scratch()
+        self._allocate_vision_int8_static_scratch()
 
         # Pre-computed decoder style params — frontend pre-computes these in
         # its native framework and passes raw bf16 bytes; see frontend's
@@ -346,6 +354,23 @@ class Pi05Pipeline:
         ds = self.chunk_size
         B["dec_act_int8"] = CudaBuffer.device_zeros(ds * DEC_D, INT8)
         B["dec_act_int8_large"] = CudaBuffer.device_zeros(ds * 2 * DEC_H, INT8)
+
+    def _allocate_vision_int8_static_scratch(self) -> None:
+        """Allocate INT8 activation scratch for static-scale vision path.
+
+        Reuses the encoder INT8 scratch buffers (vision runs before encoder,
+        sizes fit: vis_seq=512 × VIS_D=1152 < enc_seq × ENC_D).
+        Only allocates the scratch if static vision INT8 is enabled.
+        """
+        if not self.use_int8_vision_static:
+            return
+        # Ensure encoder scratch exists (also needed for static vision INT8)
+        B = self.bufs
+        es = self.encoder_seq_len
+        if "enc_act_int8" not in B:
+            B["enc_act_int8"] = CudaBuffer.device_zeros(es * ENC_D, INT8)
+        if "enc_act_int8_large" not in B:
+            B["enc_act_int8_large"] = CudaBuffer.device_zeros(es * ENC_H, INT8)
 
     def _allocate_encoder_int8_scratch(self) -> None:
         """Allocate reusable INT8 activation scratch for encoder + vision paths.
@@ -567,6 +592,51 @@ class Pi05Pipeline:
         buf = small if act_n <= (small.nbytes // np.dtype(INT8).itemsize) else large
         return buf.ptr.value
 
+    def _vis_static_scale(self, name: str) -> CudaBuffer:
+        """Lazy-allocate per-site vision static INT8 scale buffer (1 float)."""
+        buf = self.vis_int8_static_scales.get(name)
+        if buf is None:
+            buf = CudaBuffer.device_zeros(1, FP32)
+            self.vis_int8_static_scales[name] = buf
+        return buf
+
+    def _vis_static_int8_gemm(self, x_norm_ptr: int, n: int, site_name: str,
+                               weight_name: str, out_ptr: int,
+                               M: int, N: int, K: int, stream: int) -> None:
+        """Vision static INT8 GEMM: static-scale quantize + CUTLASS INT8.
+
+        During calibration: uses quantize_int8_device (dynamic, writes scale).
+        After calibration:  uses quantize_int8_static (element-wise only, no reduction).
+
+        The enc_act_int8 scratch is reused (vision shapes fit within it).
+        """
+        act_i8_ptr = self._pick_enc_int8_scratch(n)
+        scale_buf = self._vis_static_scale(site_name)
+        fvk = self.fvk
+        if self.vis_int8_static_calibrated:
+            fvk.quantize_int8_static(
+                x_norm_ptr, act_i8_ptr, scale_buf.ptr.value, n, stream=stream)
+        else:
+            fvk.quantize_int8_device(
+                x_norm_ptr, act_i8_ptr, scale_buf.ptr.value, n, stream=stream)
+        self._int8_gemm_fused(
+            act_i8_ptr, weight_name, out_ptr, M, N, K, scale_buf.ptr.value, stream)
+
+    def calibrate_int8_vision_static(self, stream: int = 0) -> None:
+        """Run one vision forward pass to collect per-site static INT8 scales.
+
+        After this call, each vision site (QKV, O, up, down × 27 layers) has
+        a calibrated per-tensor scale stored in vis_int8_static_scales.
+        Subsequent inference calls use quantize_int8_static (1 kernel per site).
+        """
+        if self.vis_int8_static_calibrated:
+            return
+        # One forward pass with dynamic quantize_int8_device fills all scales
+        self.vis_int8_static_calibrated = False
+        self.vision_encoder(stream=stream)
+        self._cudart.cudaDeviceSynchronize()
+        self.vis_int8_static_calibrated = True
+
     def _enc_int8_gemm(self, act_bf16_ptr: int, act_n: int, weight_name: str,
                        out_bf16_ptr: int, M: int, N: int, K: int, stream: int) -> None:
         """INT8 GEMM for the encoder: rowwise-quantize BF16 activation then CUTLASS.
@@ -731,6 +801,7 @@ class Pi05Pipeline:
         B = self.bufs
         attn_ptrs = self._attn_ptrs
         use_int8_vis = self.use_int8_vision
+        use_int8_vis_static = self.use_int8_vision_static
 
         # Attention LayerNorm → x_norm
         fvk.layer_norm(
@@ -739,8 +810,14 @@ class Pi05Pipeline:
             B["vision_x_norm"].ptr.value,
             seq, VIS_D, 1e-5, stream=stream)
 
-        # QKV GEMM (INT8 / FP8 / BF16) → vision_QKV
-        if use_int8_vis:
+        # QKV GEMM (static INT8 / dynamic INT8 / FP8 / BF16) → vision_QKV
+        if use_int8_vis_static:
+            self._vis_static_int8_gemm(
+                B["vision_x_norm"].ptr.value, seq * VIS_D,
+                f"vis_qkv_{i}", f"vision_attn_qkv_w_{i}",
+                B["vision_QKV"].ptr.value,
+                seq, 3 * VIS_D, VIS_D, stream)
+        elif use_int8_vis:
             # Reuses encoder INT8 scratch (vision shapes always fit).
             self._enc_int8_gemm(
                 B["vision_x_norm"].ptr.value, seq * VIS_D,
@@ -774,7 +851,13 @@ class Pi05Pipeline:
             "siglip", i, q_seq=VIS_SEQ_PER_VIEW, stream=stream)
 
         # Attn output projection → x_norm
-        if use_int8_vis:
+        if use_int8_vis_static:
+            self._vis_static_int8_gemm(
+                vis_o_ptr, seq * VIS_D,
+                f"vis_o_{i}", f"vision_attn_o_w_{i}",
+                B["vision_x_norm"].ptr.value,
+                seq, VIS_D, VIS_D, stream)
+        elif use_int8_vis:
             self._enc_int8_gemm(
                 vis_o_ptr, seq * VIS_D,
                 f"vision_attn_o_w_{i}",
@@ -804,7 +887,13 @@ class Pi05Pipeline:
             seq, VIS_D, 1e-5, stream=stream)
 
         # FFN up → hidden, + bias, + GELU
-        if use_int8_vis:
+        if use_int8_vis_static:
+            self._vis_static_int8_gemm(
+                B["vision_x_norm"].ptr.value, seq * VIS_D,
+                f"vis_up_{i}", f"vision_ffn_up_w_{i}",
+                B["vision_hidden"].ptr.value,
+                seq, VIS_H, VIS_D, stream)
+        elif use_int8_vis:
             self._enc_int8_gemm(
                 B["vision_x_norm"].ptr.value, seq * VIS_D,
                 f"vision_ffn_up_w_{i}",
@@ -827,7 +916,13 @@ class Pi05Pipeline:
         fvk.gelu_inplace(B["vision_hidden"].ptr.value, seq * VIS_H, stream=stream)
 
         # FFN down → x_norm, then x += x_norm + down_bias
-        if use_int8_vis:
+        if use_int8_vis_static:
+            self._vis_static_int8_gemm(
+                B["vision_hidden"].ptr.value, seq * VIS_H,
+                f"vis_down_{i}", f"vision_ffn_down_w_{i}",
+                B["vision_x_norm"].ptr.value,
+                seq, VIS_D, VIS_H, stream)
+        elif use_int8_vis:
             self._enc_int8_gemm(
                 B["vision_hidden"].ptr.value, seq * VIS_H,
                 f"vision_ffn_down_w_{i}",

@@ -455,6 +455,7 @@ class Pi05TorchFrontendRtx:
         self._vision_pool_factor = int(vision_pool_factor)
         from flash_rt.models.pi05.pipeline_rtx import VIS_L as _VIS_L
         self._vision_num_layers = _VIS_L if vision_num_layers is None else int(vision_num_layers)
+        # _use_int8_vision_static is set after _force_int8_decoder below
 
         self.latency_records: list[float] = []
         self.calibrated = False
@@ -472,10 +473,11 @@ class Pi05TorchFrontendRtx:
         # On non-FP8 GPUs (e.g. Orin SM87), enable encoder INT8 alongside
         # decoder INT8 so all large GEMMs benefit from tensor-core acceleration.
         self._use_int8_encoder = self._force_int8_decoder
-        # Vision GEMMs (VIS_D=1152, seq=512) are too small for INT8 to win
-        # on Orin: the per-row quantization overhead exceeds the tensor-core
-        # throughput gain at these shapes.  Keep vision in BF16.
+        # Vision GEMMs (VIS_D=1152, seq=512): per-row dynamic INT8 has too
+        # much quantization overhead. Use static per-tensor INT8 instead
+        # (1 element-wise kernel vs 3 with reduction).
         self._use_int8_vision = False
+        self._use_int8_vision_static = self._force_int8_decoder
         env_force_bf16 = os.environ.get("FVK_PI05_RTX_FORCE_BF16", "0") == "1"
         self._force_bf16 = (
             (env_force_bf16 or not supports_fp8()) and
@@ -526,6 +528,8 @@ class Pi05TorchFrontendRtx:
             self._quantize_encoder_int8()
         if self._use_int8_vision:
             self._quantize_vision_int8()
+        if self._use_int8_vision_static:
+            self._quantize_vision_int8()  # pre-quantize weights; activations use static calibrated scales
 
         # ── Pre-compute decoder styles (time MLP + style modulation) ──
         self._precomputed_styles = _precompute_decoder_styles(
@@ -571,13 +575,14 @@ class Pi05TorchFrontendRtx:
         if self._force_int8_decoder:
             logger.warning(
                 "FVK_PI05_RTX_FORCE_INT8=1 set: enabling INT8 decoder + "
-                "encoder + vision paths on the Pi0.5 RTX pipeline (Orin mode).")
+                "encoder + static-INT8 vision paths (Orin mode).")
             return {
                 "use_fp8": False,
                 "use_fp8_decoder": False,
                 "use_int8_decoder": True,
                 "use_int8_encoder": self._use_int8_encoder,
                 "use_int8_vision": self._use_int8_vision,
+                "use_int8_vision_static": self._use_int8_vision_static,
             }
         if self._force_bf16:
             reason = (
@@ -595,6 +600,7 @@ class Pi05TorchFrontendRtx:
                 "use_int8_decoder": False,
                 "use_int8_encoder": False,
                 "use_int8_vision": False,
+                "use_int8_vision_static": False,
             }
         return {
             "use_fp8": True,
@@ -602,6 +608,7 @@ class Pi05TorchFrontendRtx:
             "use_int8_decoder": False,
             "use_int8_encoder": False,
             "use_int8_vision": False,
+            "use_int8_vision_static": False,
         }
 
     # -----------------------------------------------------------------
@@ -932,6 +939,11 @@ class Pi05TorchFrontendRtx:
                 vision_pool_factor=self._vision_pool_factor,
                 vision_num_layers=self._vision_num_layers,
                 **self._pipeline_precision_kwargs())
+            # Static INT8 vision scales are per-pipeline-instance.
+            # Reset so calibrate_single_frame collects fresh scales.
+            if self.pipeline.use_int8_vision_static:
+                self.pipeline.vis_int8_static_calibrated = False
+                self.pipeline.vis_int8_static_scales = {}
 
         # Upload language embeds into pipeline's encoder_x slot
         embeds_np = embeds.contiguous().view(torch.uint16).cpu().numpy()
@@ -1121,9 +1133,16 @@ class Pi05TorchFrontendRtx:
             self._cudart.cudaStreamSynchronize(
                 ctypes.c_void_p(stream_int))
 
-            # Flip calibrated flag (FP8 only; INT8 keeps runtime-dynamic
-            # activation scales and does not require a separate calibration pass).
+            # FP8 calibration (no-op for INT8 pipelines).
             self.pipeline.calibrate_fp8()
+            # Static INT8 vision: the run_pipeline() call above already ran one
+            # vision forward with quantize_int8_device, writing per-site scales
+            # into vis_int8_static_scales. Flip the flag to switch to the fast
+            # static path (quantize_int8_static) for all subsequent calls.
+            if self.pipeline.use_int8_vision_static:
+                self.pipeline.vis_int8_static_calibrated = True
+                logger.info("Static INT8 vision calibrated: %d sites",
+                            len(self.pipeline.vis_int8_static_scales))
             self.pipeline.autotune_gemms()
             self.pipeline.record_infer_graph(external_stream_int=stream_int)
 
