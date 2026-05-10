@@ -177,8 +177,9 @@ All measurements: `FVK_PI05_RTX_FORCE_INT8=1`, cool conditions, p50.
 | 3 | **fused `rms_norm_int8_rowwise` kernel** | ~132 ms | 7.6 Hz |
 | 4 | **Vision BF16 autotune** (5 shapes) | ~130 ms | 7.7 Hz |
 | 5 | **`num_steps=5`** + `add_bias_bf16` | ~113 ms | 8.8 Hz |
-| — | **1-camera mode** (num_views=1, 5步) | **72 ms** | **13.9 Hz** |
-| — | **1-camera mode** (num_views=1, 10步) | **89 ms** | **11.2 Hz** |
+| 6 | **Vision 2×2 token pooling** (enc_seq 522→138) | **74 ms** | **13.5 Hz** |
+| — | 1-camera mode (num_views=1, 5步, no pool) | 72 ms | 13.9 Hz |
+| — | 1-camera + pool=2 (5步) | ~48 ms | ~20 Hz (est.) |
 
 ### Optimization 1: Encoder INT8
 
@@ -237,20 +238,26 @@ ThorU 用 `add_bias_fp16` 做正确的 in-place bias 加法。Orin 原先用
 替换为 `fvk.add_bias_bf16(x, bias, S, D, stream)` 节省 ~33% bandwidth
 在 54 次 vision bias add 上（QKV × 27 + FFN-up × 27）。
 
-### 最终性能（合成随机图像，等价于真实数据延迟）
+### 最终性能矩阵（合成随机图像，等价于真实数据延迟）
 
-| 配置 | p50 | min | Hz |
-|---|---|---|---|
-| 2-camera, 5步 | 113.1 ms | 110.9 ms | **8.84 Hz** |
-| **1-camera, 5步** | **71.9 ms** | **71.5 ms** | **13.91 Hz** |
-| 2-camera, 10步 | 131.8 ms | 130.5 ms | 7.59 Hz |
-| 1-camera, 10步 | 89.3 ms | 88.8 ms | 11.20 Hz |
+所有测量：`FVK_PI05_RTX_FORCE_INT8=1`，稳态凉机，p50。
 
-测量说明：随机 `uint8` 图像形状与真实数据相同，计算量完全一致，
-延迟结论等价于真实相机输入。
+| 配置 | pool | num_views | num_steps | p50 | min | Hz |
+|---|---|---|---|---|---|---|
+| 基准（BF16）| 1 | 2 | 10 | ~193 ms | — | 5.2 |
+| INT8 优化后 | 1 | 2 | 10 | 132 ms | 130 ms | 7.6 |
+| INT8 + 5步 | 1 | 2 | 5 | 113 ms | 112 ms | 8.8 |
+| INT8 + 1-camera | 1 | 1 | 5 | 72 ms | 71 ms | 13.9 |
+| **INT8 + pool=2** | **2** | **2** | **5** | **74 ms** | **73 ms** | **13.5** |
+| INT8 + pool=2 | 2 | 2 | 10 | 92 ms | 90 ms | 10.9 |
 
-1-camera 比 2-camera 快 57%：`encoder_seq` 从 522 → 266，
-encoder gate_up GEMM 计算量和 vision pass 同时减半。
+测量说明：随机 `uint8` 图像，形状与真实数据相同，延迟等价。
+
+**Vision 2×2 池化说明**：
+- SigLIP 仍完整运行 27层处理 512 tokens（图像精度不变）
+- 输出后做 2×2 空间平均池化：16×16 → 8×8 = 64 token/view
+- `encoder_seq` 从 522 → 138（-74%），encoder 时间大幅下降
+- **代价**：空间精度损失，需要在真实任务上验证质量影响
 
 ### Phase Breakdown (2-camera, 5 步)
 
@@ -283,6 +290,29 @@ ThorU 可借鉴、已移植到 Orin 的部分：
 | `fmha_strided_full` | 未加载（需 libfmha_fp16_strided.so） | ❌ 未实现 |
 | FP8 GEMM epilogue | cuBLASLt NOT_SUPPORTED on SM87 | ❌ 不可用 |
 
+### Optimization 6: Vision Token Pooling (`vision_pool_factor=2`)
+
+**原理**：SigLIP 输出 256 tokens/view（16×16 空间格），做 2×2 平均池化
+降到 64 tokens/view（8×8 格），encoder_seq 从 522 → 138（-74%）。
+
+**实现**（`csrc/kernels/norm.cu`）：
+
+```cuda
+// avg_pool_vision_tokens(x, out, nv, H, W, dim, pool_factor, stream)
+// x: (nv*H*W, dim) BF16 → out: (nv*(H/f)*(W/f), dim) BF16
+// Launch: gridDim=(nv*out_spv,), blockDim=256
+```
+
+SigLIP 仍完整运行 27层（图像处理精度不变），池化仅发生在送入 Gemma
+encoder 之前，不影响 SigLIP 的特征提取过程。
+
+**影响**：
+- `encoder_seq` 522 → 138，encoder GEMM 时间 ~62ms → ~20ms
+- decoder cross-attention 的 kv_len 也缩短，decoder 时间减少
+- **质量代价**：空间精度被平均，需要在真实任务上验证
+
+**参数**：`Pi05TorchFrontendRtx(..., vision_pool_factor=2)`（默认 1 = 无池化）
+
 ### CUTLASS INT8 vs FP8 Epilogue Fusion 说明
 
 CUTLASS 的 **EVT（Epilogue Visitor Tree）** 框架对 INT8 和 FP8 都支持
@@ -298,38 +328,38 @@ bias、residual、GELU 等 epilogue 融合（这是 CUTLASS raw API 层面的能
 ### Quickstart
 
 ```python
-import sys
+import sys, os
 sys.path.insert(0, "/data/wy/FlashRT")
-from flash_rt.frontends.torch.pi05_rtx import Pi05TorchFrontendRtx
-import numpy as np, os
-
 os.environ["FVK_PI05_RTX_FORCE_INT8"] = "1"
 
-# ── 选择配置 ──────────────────────────────────────────────
-# 最快：单摄 5步 → ~72ms / 13.9 Hz
+from flash_rt.frontends.torch.pi05_rtx import Pi05TorchFrontendRtx
+import numpy as np
+
+# ── 配置选择 ──────────────────────────────────────────────────────────
+# 最快（双摄 + 池化 + 5步）→ ~74ms / 13.5 Hz
 pipe = Pi05TorchFrontendRtx(
     "/data/wy/orin_pi05_droid_pytorch",
-    num_views=1,   # 只用 base camera
+    num_views=2,
     num_steps=5,
+    vision_pool_factor=2,   # 2×2 空间池化：256→64 token/view
 )
 
-# 最优质量：双摄 10步 → ~132ms / 7.6 Hz
-# pipe = Pi05TorchFrontendRtx(..., num_views=2, num_steps=10)
+# 无损质量（双摄 + 无池化 + 10步）→ ~132ms / 7.6 Hz
+# pipe = Pi05TorchFrontendRtx(..., num_views=2, num_steps=10, vision_pool_factor=1)
 
-# 双摄平衡：双摄 5步 → ~113ms / 8.8 Hz
-# pipe = Pi05TorchFrontendRtx(..., num_views=2, num_steps=5)
-# ─────────────────────────────────────────────────────────
+# 单摄高速（无池化 + 5步）→ ~72ms / 13.9 Hz
+# pipe = Pi05TorchFrontendRtx(..., num_views=1, num_steps=5, vision_pool_factor=1)
+# ─────────────────────────────────────────────────────────────────────
 
 pipe.set_prompt("pick up the black envelope on the table")
 
 img = np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8)
-obs = {"image": img}                          # num_views=1 只传 image
-# obs = {"image": img, "wrist_image": img}   # num_views=2
+obs = {"image": img, "wrist_image": img}   # num_views=2
 
-pipe.calibrate_with_real_data([obs])          # 一次性初始化，~2s
+pipe.calibrate_with_real_data([obs])       # 一次性初始化，~2s
 
 result = pipe.infer(obs)
-actions = result["actions"]  # (10, 7) numpy — 10 chunk, 7 DoF
+actions = result["actions"]  # (10, 7) numpy
 ```
 
 ### 构建命令（Orin SM87）
