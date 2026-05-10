@@ -240,24 +240,43 @@ ThorU 用 `add_bias_fp16` 做正确的 in-place bias 加法。Orin 原先用
 
 ### 最终性能矩阵（合成随机图像，等价于真实数据延迟）
 
-所有测量：`FVK_PI05_RTX_FORCE_INT8=1`，稳态凉机，p50。
+所有测量：`FVK_PI05_RTX_FORCE_INT8=1`，稳态，p50。
 
-| 配置 | pool | num_views | num_steps | p50 | min | Hz |
+**可调参数**（全部运行时参数，无需重编）：
+- `num_views`: 1 或 2
+- `vision_pool_factor`: 1（无池化）/ 2（4× reduce）/ 4（16× reduce）
+- `vision_num_layers`: 1-27（SigLIP 层数，default=27）
+- `num_steps`: ODE 步数（default=10）
+
+| num_views | pool | vis_layers | steps | p50 | Hz | 说明 |
 |---|---|---|---|---|---|---|
-| 基准（BF16）| 1 | 2 | 10 | ~193 ms | — | 5.2 |
-| INT8 优化后 | 1 | 2 | 10 | 132 ms | 130 ms | 7.6 |
-| INT8 + 5步 | 1 | 2 | 5 | 113 ms | 112 ms | 8.8 |
-| INT8 + 1-camera | 1 | 1 | 5 | 72 ms | 71 ms | 13.9 |
-| **INT8 + pool=2** | **2** | **2** | **5** | **74 ms** | **73 ms** | **13.5** |
-| INT8 + pool=2 | 2 | 2 | 10 | 92 ms | 90 ms | 10.9 |
+| 2 | 1 | 27 | 10 | 132 ms | 7.6 | 无损，最高质量 |
+| 2 | 1 | 27 | 5 | 113 ms | 8.8 | — |
+| 1 | 1 | 27 | 5 | 72 ms | 13.9 | 单摄 |
+| 2 | 2 | 27 | 5 | 74 ms | 13.5 | — |
+| 2 | 2 | 27 | 3 | 67 ms | 15.0 | — |
+| 2 | 4 | 27 | 3 | 56 ms | 17.9 | — |
+| 2 | 4 | 20 | 3 | 49 ms | 20.6 | — |
+| 2 | 4 | 14 | 3 | 42 ms | 23.9 | — |
+| 2 | 4 | 10 | 3 | 38 ms | 26.5 | — |
+| 1 | 4 | 27 | 2 | 38 ms | 26.6 | 单摄极速 |
+| 1 | 4 | 14 | 2 | 30 ms | 33.2 | — |
+| **1** | **4** | **10** | **2** | **28 ms** | **35.7 Hz** | **绝对最快** |
 
-测量说明：随机 `uint8` 图像，形状与真实数据相同，延迟等价。
+相对起点 BF16 193ms / 5.17 Hz，最高提速 **6.9×**。
 
-**Vision 2×2 池化说明**：
-- SigLIP 仍完整运行 27层处理 512 tokens（图像精度不变）
-- 输出后做 2×2 空间平均池化：16×16 → 8×8 = 64 token/view
-- `encoder_seq` 从 522 → 138（-74%），encoder 时间大幅下降
-- **代价**：空间精度损失，需要在真实任务上验证质量影响
+质量影响从低到高：pool=2 < pool=4 < vis_layers↓ < steps↓。
+推荐先评估 pool=2 + steps=5（13.5 Hz），再逐步激进。
+
+**Vision 2×2 / 4×4 池化说明**：
+- SigLIP 仍完整运行 N 层处理 512 tokens
+- 输出后做 f×f 空间平均池化：16×16 → 16/f 每边
+- `encoder_seq` 大幅下降（pool=2: 522→138，pool=4: 522→42）
+
+**vision_num_layers 层数削减说明**：
+- 运行 SigLIP 前 N 层（而非全部 27 层）
+- 模型未针对层数削减微调，质量损失随 N 减小而增大
+- **必须在真实机器人任务上验证可接受性**
 
 ### Phase Breakdown (2-camera, 5 步)
 
@@ -331,35 +350,36 @@ bias、residual、GELU 等 epilogue 融合（这是 CUTLASS raw API 层面的能
 import sys, os
 sys.path.insert(0, "/data/wy/FlashRT")
 os.environ["FVK_PI05_RTX_FORCE_INT8"] = "1"
-
 from flash_rt.frontends.torch.pi05_rtx import Pi05TorchFrontendRtx
 import numpy as np
 
-# ── 配置选择 ──────────────────────────────────────────────────────────
-# 最快（双摄 + 池化 + 5步）→ ~74ms / 13.5 Hz
+# ── 选择配置（质量从高到低，速度从低到高）────────────────────────────
+# 无损质量，全量精度  → 132ms / 7.6 Hz
+# pipe = Pi05TorchFrontendRtx("...", num_views=2, num_steps=10)
+
+# 标准部署，轻微牺牲  → 74ms / 13.5 Hz
+# pipe = Pi05TorchFrontendRtx("...", num_views=2, num_steps=5, vision_pool_factor=2)
+
+# 高速双摄           → 56ms / 17.9 Hz
+# pipe = Pi05TorchFrontendRtx("...", num_views=2, num_steps=3, vision_pool_factor=4)
+
+# 激进高速（需验证）  → 28ms / 35.7 Hz
 pipe = Pi05TorchFrontendRtx(
     "/data/wy/orin_pi05_droid_pytorch",
-    num_views=2,
-    num_steps=5,
-    vision_pool_factor=2,   # 2×2 空间池化：256→64 token/view
+    num_views=1,
+    num_steps=2,
+    vision_pool_factor=4,
+    vision_num_layers=10,  # SigLIP 前10层，质量影响待评估
 )
-
-# 无损质量（双摄 + 无池化 + 10步）→ ~132ms / 7.6 Hz
-# pipe = Pi05TorchFrontendRtx(..., num_views=2, num_steps=10, vision_pool_factor=1)
-
-# 单摄高速（无池化 + 5步）→ ~72ms / 13.9 Hz
-# pipe = Pi05TorchFrontendRtx(..., num_views=1, num_steps=5, vision_pool_factor=1)
 # ─────────────────────────────────────────────────────────────────────
 
 pipe.set_prompt("pick up the black envelope on the table")
-
 img = np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8)
-obs = {"image": img, "wrist_image": img}   # num_views=2
+obs = {"image": img}   # num_views=1
 
-pipe.calibrate_with_real_data([obs])       # 一次性初始化，~2s
-
+pipe.calibrate_with_real_data([obs])   # 一次性，~1s
 result = pipe.infer(obs)
-actions = result["actions"]  # (10, 7) numpy
+print(result["actions"].shape)         # (10, 7)
 ```
 
 ### 构建命令（Orin SM87）
