@@ -101,9 +101,9 @@ def main():
     pipe.set_prompt(args.prompt)
 
     img = np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8)
-    obs = {"image": img}
-    if args.num_views == 2:
-        obs["wrist_image"] = img
+    # Always include wrist_image — _stack_images slices to [:num_views] internally,
+    # so the extra key is harmless when num_views=1.
+    obs = {"image": img, "wrist_image": img}
 
     print("Calibrating…")
     pipe.calibrate_with_real_data([obs])
