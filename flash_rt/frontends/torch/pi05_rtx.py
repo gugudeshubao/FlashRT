@@ -473,11 +473,11 @@ class Pi05TorchFrontendRtx:
         # On non-FP8 GPUs (e.g. Orin SM87), enable encoder INT8 alongside
         # decoder INT8 so all large GEMMs benefit from tensor-core acceleration.
         self._use_int8_encoder = self._force_int8_decoder
-        # Vision GEMMs (VIS_D=1152, seq=512): per-row dynamic INT8 has too
-        # much quantization overhead. Use static per-tensor INT8 instead
-        # (1 element-wise kernel vs 3 with reduction).
+        # Vision GEMMs (VIS_D=1152, seq=512): both dynamic and static INT8
+        # cause unacceptable encoder feature degradation (cosine~0.28 vs 0.99
+        # for encoder-only INT8). Vision stays in BF16.
         self._use_int8_vision = False
-        self._use_int8_vision_static = self._force_int8_decoder
+        self._use_int8_vision_static = False
         env_force_bf16 = os.environ.get("FVK_PI05_RTX_FORCE_BF16", "0") == "1"
         self._force_bf16 = (
             (env_force_bf16 or not supports_fp8()) and
