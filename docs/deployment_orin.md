@@ -144,6 +144,37 @@ To reach 10 Hz without pooling: `num_views=1, pool=1, steps=10` → 11.2 Hz.
 Pool and layer reduction have **not been trained** — quality must be
 validated on real robot tasks.
 
+## Precision Analysis
+
+### Metric
+
+Encoder K/V cosine similarity (layer-0 key vectors vs BF16 reference)
+is a reliable quantization quality indicator — unlike final action cosine,
+it is unaffected by diffusion noise amplification.
+
+### Key Finding: Vision Static INT8 Was Broken
+
+Static per-tensor vision INT8 causes **severe encoder feature degradation**:
+
+| Configuration | Encoder K cosine | Verdict |
+|---|---|---|
+| Enc+Dec INT8, Vision BF16 | **0.991** | ✅ Use this |
+| Enc+Dec INT8, Vision static INT8 | **0.282** | ❌ Do not use |
+
+Root cause: a per-tensor scale calibrated on one image cannot capture
+SigLIP's activation range, leading to large quantization error that
+propagates through the Gemma encoder.
+
+**Fix applied**: `use_int8_vision_static = False` permanently.
+Vision runs in BF16 regardless of `FVK_PI05_RTX_FORCE_INT8=1`.
+
+### Current Numbers (after fix)
+
+| Mode | Encoder K cosine | p50 | Hz |
+|---|---|---|---|
+| BF16 | 1.000 | 195ms | 5.1 |
+| **Enc+Dec INT8 (vision=BF16)** | **0.991** | **133ms** | **7.5** |
+
 ## Phase Breakdown (pool=1, 2-camera, 5-step)
 
 | Phase | Time | Bottleneck |

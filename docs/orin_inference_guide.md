@@ -255,6 +255,55 @@ Always set `FVK_PI05_RTX_FORCE_INT8=1` on Orin for best performance.
 
 ---
 
+## Precision Analysis: BF16 vs INT8
+
+### Method
+
+Direct numerical comparison using encoder K/V cosine similarity
+(layer-0 key vectors, `enc_K[0, :enc_seq, 0, :]`). This metric
+measures how much INT8 quantization changes the vision + language
+feature representation **without** confounding from diffusion noise.
+
+Cosine similarity of final actions is NOT a reliable metric because
+the 10-step ODE amplifies any quantization error chaotically — even
+with fixed seeds, samples from the same prompt can span 0.07–0.71
+depending on the diffusion trajectory.
+
+### Results (real tabletop image, 5 prompts)
+
+| Configuration | Encoder K cosine vs BF16 | Assessment |
+|---|---|---|
+| Encoder + Decoder INT8, Vision BF16 | **0.991** | ✅ Excellent |
+| Encoder + Decoder + Vision static INT8 | **0.282** | ❌ Severe error |
+
+### Root Cause of Vision Static INT8 Failure
+
+Static per-tensor vision INT8 is calibrated from a single image.
+The per-tensor scale has too little granularity for SigLIP activations,
+causing large quantization error (cosine=0.28) that propagates through
+the Gemma encoder and corrupts the decoder's cross-attention context.
+
+**Fix**: vision static INT8 (`use_int8_vision_static`) is now disabled.
+Vision always runs in BF16 regardless of `FVK_PI05_RTX_FORCE_INT8`.
+
+### Current Precision + Performance (after fix)
+
+| Mode | Encoder K cosine | p50 | Hz |
+|---|---|---|---|
+| BF16 baseline | 1.000 | 195ms | 5.1 Hz |
+| **INT8 (enc+dec, vision=BF16)** | **0.991** | **133ms** | **7.5 Hz** |
+
+The 0.9% residual error in encoder features comes from the
+encoder's own per-row dynamic INT8 activation quantization —
+this is expected and acceptable for a W8A8 scheme.
+
+### Benchmark Script
+
+```bash
+# Run on Orin to measure encoder K/V cosine
+python3 /tmp/kv_enc_only.py   # see examples/orin/ for the full script
+```
+
 ## Troubleshooting
 
 **CUTLASS INT8 workspace error between sequential model loads:**
