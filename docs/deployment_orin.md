@@ -206,14 +206,28 @@ higher-throughput FP8), not a software gap.
 
 ## Performance Comparison: Orin vs ThorU
 
+### GPU Specs
+
+| | Orin (SM87) | ThorU (SM110) |
+|---|---|---|
+| GPU | Jetson AGX Orin | NVIDIA Thor |
+| SM count | **16** | **20** |
+| Memory BW | ~204 GB/s (LPDDR5X) | ~204 GB/s (LPDDR5X) |
+| Precision | INT8 (no native FP8) | **FP8** (native tensor core) |
+| CUDA CC | 8.7 | 11.0 |
+
 ### Measured Phase Breakdown
 
-| Phase | Orin SM87 (INT8) | ThorU SM110 (FP8) | Ratio |
+nsys measured (pool=1, 2-cam, 10-step, 3 inferences):
+
+| Phase (nsys kernel group) | Orin SM87 (INT8) | ThorU SM110 (FP8) | Ratio |
 |---|---|---|---|
-| Vision SigLIP 27L | 26 ms | ~10 ms | 2.6× |
-| Encoder Gemma-2B 18L | 66 ms | ~18 ms | 3.7× |
-| Decoder 300M 18L×10 steps | 59 ms | ~17 ms | 3.5× |
-| **Total (10 steps, 2-cam)** | **~151 ms / 6.6 Hz** | **~45 ms / 22 Hz** | **3.4×** |
+| **GEMM kernels** | **86.8 ms (62%)** | **13.8 ms (30%)** | **6.3×** |
+| Attention (FMHA) | 8.7 ms (6%) | 16.8 ms (37%) | 0.52× (Orin faster!) |
+| Gated SiLU / norms / etc | 18.5 ms (13%) | 7.2 ms (16%) | 2.6× |
+| Quantize overhead | 16.1 ms (11%) | 0.8 ms (2%) | 20× |
+| Other | 10.7 ms (8%) | 7.4 ms (16%) | — |
+| **Total** | **~140 ms / 7.2 Hz** | **~46 ms / 22 Hz** | **3×** |
 
 GPU specs: Orin = 16 SMs, 61 GB unified; ThorU = more SMs, same ~204 GB/s BW.
 
@@ -229,23 +243,37 @@ Largest GEMM: encoder gate+up (560, 32768, 2048)
   ThorU N  SM: 1280 / N  = <<80 waves → N≈4–6× more SMs → ~4× faster here
 ```
 
-Three compounding factors:
+Key findings from nsys+ncu:
 
-1. **SM count** (primary): Orin has 16 SMs; ThorU has significantly more.
-   Large GEMMs require many sequential "waves" on Orin, each using all 16 SMs.
+1. **FP8 TOPS per SM (primary)**: ThorU has only 20 SMs vs Orin's 16 (1.25×).
+   Yet ThorU GEMMs are **6.3× faster**. This means FP8 on SM110 delivers
+   ~5× more TOPS per SM than INT8 on SM87. This is the dominant factor.
 
-2. **FP8 vs INT8 tensor core throughput** (secondary):
-   SM110 has dedicated FP8 tensor cores with higher TOPS/SM.
-   SM87 (Ampere) has INT8 tensor cores; no native FP8.
+2. **Attention: Orin is faster!** ThorU uses custom `nvjet` FMHA kernels
+   (16.8 ms/inf, 37% of total) vs Orin's FA2 (8.7 ms/inf, 6% of total).
+   ThorU's attention is 1.9× slower. This is why ThorU's bottleneck is
+   attention-limited while Orin is GEMM-limited.
 
-3. **GEMM epilogue fusion** (tertiary):
-   ThorU: `fp8_nn_gelu_bias` — GEMM + bias + GELU in one kernel.
-   Orin: three separate kernels (GEMM, bias_add, gelu_inplace).
-   `CUBLASLT_EPILOGUE_BIAS` returns NOT_SUPPORTED on SM87 for BF16.
+3. **Quantize overhead**: Orin needs 16.1 ms/inf for INT8 per-row quantization.
+   ThorU needs only 0.8 ms/inf for static FP8 scalar quantize. This 20×
+   difference reflects the cost of Orin's dynamic per-row scale computation.
 
-The 3.4× gap is a **hardware gap**, not primarily a software gap.
-Software optimizations (INT8 quantization, fused norm kernels, autotune)
-have already extracted most of the available headroom on SM87.
+4. **GEMM epilogue fusion**: ThorU fuses GELU+bias into each GEMM kernel.
+   Orin cannot (CUBLASLT_EPILOGUE_BIAS returns NOT_SUPPORTED on SM87).
+
+**ncu result (encoder gate_up, the largest GEMM):**
+
+| GEMM | GPU throughput | INT8/FP8 tensor core active |
+|---|---|---|
+| Orin INT8 (560, 32768, 2048) | 92.3% | IMMA 80.1% |
+| ThorU FP8 (560, 32768, 2048) | 73.7% | — (SM100 architecture) |
+
+Orin's encoder GEMM is actually at **higher GPU utilization** (92%) than
+ThorU (74%) for this shape. The speedup on ThorU is purely from higher
+absolute TOPS per SM in FP8, not better kernel efficiency.
+
+The 3× total gap is a **hardware gap** (FP8 TOPS), not a software gap.
+Software optimizations have extracted most available headroom on SM87.
 
 ## Comparison with ThorU
 
