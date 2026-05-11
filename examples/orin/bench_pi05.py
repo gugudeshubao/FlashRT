@@ -57,8 +57,10 @@ def parse_args():
                    help="Warmup iterations before measurement")
     p.add_argument("--reps", type=int, default=15,
                    help="Measurement iterations")
-    p.add_argument("--int8", action="store_true", default=True,
-                   help="Enable INT8 (default on; set FVK_PI05_RTX_FORCE_INT8=1)")
+    p.add_argument("--int8", action="store_true", default=False,
+                   help="Enable INT8 encoder/decoder/vision (sets FVK_PI05_RTX_FORCE_INT8=1)")
+    p.add_argument("--no-int8", dest="int8", action="store_false",
+                   help="Disable INT8, run BF16 (default)")
     return p.parse_args()
 
 

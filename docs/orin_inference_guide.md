@@ -108,10 +108,19 @@ Build time: ~20 seconds.
 
 `examples/orin/bench_pi05.py` provides preset-based benchmarking.
 
-### Presets
+### BF16 Baseline (without INT8)
 
-All numbers measured on Jetson AGX Orin (SM87, 16 SMs, LPDDR5X ~204 GB/s)
-with `FVK_PI05_RTX_FORCE_INT8=1`, stable conditions, p50.
+Default mode when `FVK_PI05_RTX_FORCE_INT8` is not set:
+
+| num_views | pool | layers | steps | p50 | Hz |
+|---|---|---|---|---|---|
+| 2 | 1 | 27 | 10 | 195.0 ms | 5.1 Hz |
+| 2 | 1 | 27 | 5 | 170.1 ms | 5.9 Hz |
+
+### INT8 Presets (`FVK_PI05_RTX_FORCE_INT8=1`)
+
+All numbers measured on Jetson AGX Orin (SM87, 16 SMs, LPDDR5X ~204 GB/s),
+stable conditions, p50.
 
 | Preset | num_views | pool | layers | steps | p50 | Hz | Notes |
 |---|---|---|---|---|---|---|---|
@@ -122,23 +131,32 @@ with `FVK_PI05_RTX_FORCE_INT8=1`, stable conditions, p50.
 | `fastest` | 1 | 4 | 27 | 3 | 38.1 ms | **26.3 Hz** | Single camera |
 | *(custom)* | 1 | 1 | 27 | 10 | 86.7 ms | **11.5 Hz** | 1-camera lossless |
 
+INT8 speedup vs BF16: **1.5× (10-step)**, up to **5.1× (fastest vs BF16 baseline)**.
+
 ### Usage
 
 ```bash
-# Named preset
-FVK_PI05_RTX_FORCE_INT8=1 python3 examples/orin/bench_pi05.py \
+# INT8 mode (recommended) — named preset
+python3 examples/orin/bench_pi05.py \
+    --checkpoint /path/to/pi05_droid_pytorch \
+    --preset lossless \
+    --int8
+
+# BF16 baseline (default, no --int8 flag)
+python3 examples/orin/bench_pi05.py \
     --checkpoint /path/to/pi05_droid_pytorch \
     --preset lossless
 
-# Manual parameters
-FVK_PI05_RTX_FORCE_INT8=1 python3 examples/orin/bench_pi05.py \
+# Manual parameters with INT8
+python3 examples/orin/bench_pi05.py \
     --checkpoint /path/to/pi05_droid_pytorch \
     --num-views 2 \
     --pool 1 \
     --layers 27 \
     --steps 10 \
     --warmup 8 \
-    --reps 15
+    --reps 15 \
+    --int8
 
 # Help
 python3 examples/orin/bench_pi05.py --help
