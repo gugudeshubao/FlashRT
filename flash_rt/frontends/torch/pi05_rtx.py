@@ -447,7 +447,8 @@ class Pi05TorchFrontendRtx:
                  num_steps: int = NUM_STEPS_DEFAULT,
                  vision_pool_factor: int = 1,
                  vision_num_layers: Optional[int] = None,
-                 cache_frames: int = 1):
+                 cache_frames: int = 1,
+                 use_tiny_q_attn: bool = False):
         checkpoint_dir = pathlib.Path(checkpoint_dir)
         self.num_views = int(num_views)
         self.chunk_size = int(chunk_size)
@@ -460,6 +461,7 @@ class Pi05TorchFrontendRtx:
         # cache_frames=2 = full, decode, full, decode, ...
         self._cache_frames = max(1, int(cache_frames))
         self._frame_count = 0
+        self._use_tiny_q_attn = bool(use_tiny_q_attn)
         from flash_rt.models.pi05.pipeline_rtx import VIS_L as _VIS_L
         self._vision_num_layers = _VIS_L if vision_num_layers is None else int(vision_num_layers)
         # _use_int8_vision_static is set after _force_int8_decoder below
@@ -477,9 +479,16 @@ class Pi05TorchFrontendRtx:
         self._rl_current_prompt_text: Optional[str] = None
         self._force_int8_decoder = os.environ.get(
             "FVK_PI05_RTX_FORCE_INT8", "0") == "1"
+        # FVK_PI05_RTX_INT8_ENCODER_ONLY=1: enable INT8 for encoder (large M,
+        # 92% GPU utilisation) but keep decoder in BF16 (M=10 → INT8 CUTLASS
+        # tile waste makes it slower than cuBLASLt BF16 for small M).
+        _enc_only = os.environ.get("FVK_PI05_RTX_INT8_ENCODER_ONLY", "0") == "1"
+        if _enc_only:
+            self._force_int8_decoder = False   # BF16 decoder
         # On non-FP8 GPUs (e.g. Orin SM87), enable encoder INT8 alongside
         # decoder INT8 so all large GEMMs benefit from tensor-core acceleration.
-        self._use_int8_encoder = self._force_int8_decoder
+        self._use_int8_encoder = self._force_int8_decoder or _enc_only
+        self._int8_encoder_only = _enc_only
         # Vision GEMMs (VIS_D=1152, seq=512): both dynamic and static INT8
         # cause unacceptable encoder feature degradation (cosine~0.28 vs 0.99
         # for encoder-only INT8). Vision stays in BF16.
@@ -579,14 +588,14 @@ class Pi05TorchFrontendRtx:
                     self.num_views, self.chunk_size)
 
     def _pipeline_precision_kwargs(self) -> dict:
-        if self._force_int8_decoder:
-            logger.warning(
-                "FVK_PI05_RTX_FORCE_INT8=1 set: enabling INT8 decoder + "
-                "encoder + static-INT8 vision paths (Orin mode).")
+        if self._force_int8_decoder or getattr(self, "_int8_encoder_only", False):
+            mode = ("INT8 encoder+decoder" if self._force_int8_decoder
+                    else "INT8 encoder only (decoder stays BF16 for M=10 efficiency)")
+            logger.warning("FVK_PI05_RTX_FORCE_INT8/INT8_ENCODER_ONLY set: %s", mode)
             return {
                 "use_fp8": False,
                 "use_fp8_decoder": False,
-                "use_int8_decoder": True,
+                "use_int8_decoder": self._force_int8_decoder,
                 "use_int8_encoder": self._use_int8_encoder,
                 "use_int8_vision": self._use_int8_vision,
                 "use_int8_vision_static": self._use_int8_vision_static,
@@ -944,6 +953,7 @@ class Pi05TorchFrontendRtx:
                 num_steps=self._num_steps,
                 vision_pool_factor=self._vision_pool_factor,
                 vision_num_layers=self._vision_num_layers,
+                use_tiny_q_attn=self._use_tiny_q_attn,
                 **self._pipeline_precision_kwargs())
             # Static INT8 vision scales are per-pipeline-instance.
             # Reset so calibrate_single_frame collects fresh scales.

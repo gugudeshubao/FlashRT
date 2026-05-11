@@ -16,6 +16,7 @@ Quick presets (pool=1 is lossless, pool>1 trades spatial detail for speed):
     --preset balanced    → 2cam pool=1 steps=5   (~110ms / 9.1 Hz)
     --preset fast        → 2cam pool=2 steps=5   (~74ms  / 13.5 Hz)
     --preset fastest     → 1cam pool=4 steps=3   (~41ms  / 24.3 Hz)
+    --preset tinyq       → 2cam pool=1 steps=10, tiny-q attn (target: ~115ms / 8.7 Hz → cache=1; ~75ms / 13+ Hz → cache=2)
 """
 
 import argparse
@@ -30,11 +31,14 @@ import numpy as np
 # ---------------------------------------------------------------------------
 
 PRESETS = {
-    "lossless":  dict(num_views=2, pool=1, layers=27, steps=10),
-    "balanced":  dict(num_views=2, pool=1, layers=27, steps=5),
-    "fast":      dict(num_views=2, pool=2, layers=27, steps=5),
-    "faster":    dict(num_views=2, pool=4, layers=27, steps=3),
-    "fastest":   dict(num_views=1, pool=4, layers=27, steps=3),
+    "lossless":  dict(num_views=2, pool=1, layers=27, steps=10, tiny_q=False),
+    "balanced":  dict(num_views=2, pool=1, layers=27, steps=5,  tiny_q=False),
+    "fast":      dict(num_views=2, pool=2, layers=27, steps=5,  tiny_q=False),
+    "faster":    dict(num_views=2, pool=4, layers=27, steps=3,  tiny_q=False),
+    "fastest":   dict(num_views=1, pool=4, layers=27, steps=3,  tiny_q=False),
+    # tiny-q: EXPERIMENTAL — scalar warp-reduction kernel, ~14ms SLOWER than FA2
+    # (FA2 uses SM87 tensor cores for QK/AV; scalar kernel cannot match)
+    "tinyq":     dict(num_views=2, pool=1, layers=27, steps=10, tiny_q=True),
 }
 
 
@@ -63,6 +67,10 @@ def parse_args():
                    help="Disable INT8, run BF16 (default)")
     p.add_argument("--cache-frames", type=int, default=1,
                    help="Temporal K/V cache: run full pipeline every N frames (1=off)")
+    p.add_argument("--tiny-q-attn", action="store_true", default=False,
+                   help="Use custom warp-per-(q,h) decoder cross-attention instead of FA2")
+    p.add_argument("--int8-encoder-only", action="store_true", default=False,
+                   help="INT8 encoder + BF16 decoder (tests M=10 cuBLAS BF16 vs INT8 CUTLASS)")
     return p.parse_args()
 
 
@@ -72,18 +80,24 @@ def main():
     # Apply preset if given
     if args.preset:
         cfg = PRESETS[args.preset]
-        args.num_views = cfg["num_views"]
-        args.pool      = cfg["pool"]
-        args.layers    = cfg["layers"]
-        args.steps     = cfg["steps"]
+        args.num_views    = cfg["num_views"]
+        args.pool         = cfg["pool"]
+        args.layers       = cfg["layers"]
+        args.steps        = cfg["steps"]
+        args.tiny_q_attn  = cfg.get("tiny_q", False)
         print(f"Preset '{args.preset}': "
               f"num_views={args.num_views} pool={args.pool} "
-              f"layers={args.layers} steps={args.steps}")
+              f"layers={args.layers} steps={args.steps} "
+              f"tiny_q={args.tiny_q_attn}")
 
     # Enforce INT8 env var
     if args.int8 and not os.environ.get("FVK_PI05_RTX_FORCE_INT8"):
         os.environ["FVK_PI05_RTX_FORCE_INT8"] = "1"
         print("Auto-set FVK_PI05_RTX_FORCE_INT8=1")
+    if args.int8_encoder_only:
+        os.environ.pop("FVK_PI05_RTX_FORCE_INT8", None)
+        os.environ["FVK_PI05_RTX_INT8_ENCODER_ONLY"] = "1"
+        print("Auto-set FVK_PI05_RTX_INT8_ENCODER_ONLY=1 (encoder INT8, decoder BF16)")
 
     import logging
     logging.basicConfig(level=logging.WARNING)
@@ -101,6 +115,7 @@ def main():
         vision_pool_factor=args.pool,
         vision_num_layers=args.layers,
         cache_frames=args.cache_frames,
+        use_tiny_q_attn=args.tiny_q_attn,
     )
 
     pipe.set_prompt(args.prompt)

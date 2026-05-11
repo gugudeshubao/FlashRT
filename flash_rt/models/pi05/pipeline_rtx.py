@@ -160,7 +160,8 @@ class Pi05Pipeline:
                  use_int8_vision_static: bool = False,
                  vision_pool_factor: int = 1,
                  vision_num_layers: int = VIS_L,
-                 num_steps: int = NUM_STEPS_DEFAULT):
+                 num_steps: int = NUM_STEPS_DEFAULT,
+                 use_tiny_q_attn: bool = False):
         self.gemm = gemm
         self.fvk = fvk
         self.attn = attn_backend
@@ -183,6 +184,9 @@ class Pi05Pipeline:
         self.vis_int8_static_calibrated = False
         self.vision_pool_factor = int(vision_pool_factor)
         self.vision_num_layers = int(vision_num_layers)
+        # Tiny-q custom attention: replaces FA2 decoder cross-attention with a
+        # warp-per-(q,h) online-softmax kernel; ~10× faster for q=10, kv~532.
+        self.use_tiny_q_attn = bool(use_tiny_q_attn)
 
         # Derived sizes
         # vision_seq: full SigLIP token count (pre-pooling) — used for SigLIP buffers
@@ -321,6 +325,18 @@ class Pi05Pipeline:
         # Decoder scratch for ada_rms_norm output + gate
         B["x_normed_buf"] = CudaBuffer.device_empty(ds * DEC_D, BF16)
         B["gate_buf"] = CudaBuffer.device_empty(ds * DEC_D, BF16)
+        # Split-kv attention output + scratch buffers.
+        # phase1 writes: O_partial (NH × KV_SPLITS × 16 × HD) float32
+        #                m_partial, l_partial (NH × KV_SPLITS × 16) float32
+        # phase2 output:  dec_tiny_attn_O (ds × NH × HD) BF16
+        _KV_SPLITS = 4; _Q_PAD = 16
+        B["dec_tiny_attn_O"]      = CudaBuffer.device_empty(ds * DEC_NH * DEC_HD, BF16)
+        B["dec_attn_O_partial"]   = CudaBuffer.device_empty(
+            DEC_NH * _KV_SPLITS * _Q_PAD * DEC_HD, FP32)
+        B["dec_attn_m_partial"]   = CudaBuffer.device_empty(
+            DEC_NH * _KV_SPLITS * _Q_PAD, FP32)
+        B["dec_attn_l_partial"]   = CudaBuffer.device_empty(
+            DEC_NH * _KV_SPLITS * _Q_PAD, FP32)
 
         # Scratch for vision patch im2col output (BF16 (nv*256, 588))
         B["vision_patches"] = CudaBuffer.device_empty(vs * VIS_PATCH_FLAT, BF16)
@@ -1344,19 +1360,25 @@ class Pi05Pipeline:
             DEC_HD, stream=stream)
 
         # C3: Cross-attention (decoder Q over enc+dec K/V cache) — returns ptr.
-        # Stage 2a of upstream refactor: migrated from legacy
-        # ``decoder_attn(layer, enc_seq, dec_seq)`` to AttentionBackend
-        # protocol's ``run("decoder", layer, q_seq=dec_seq,
-        # kv_seq=enc_seq+dec_seq)``. The decoder site is cross-attention
-        # so kv_seq is required; it equals total KV length including
-        # the chunk the pipeline just wrote into enc_K/V[l,
-        # enc_seq:enc_seq+chunk] above.
-        dec_o_ptr = self.attn.run(
-            "decoder", i,
-            q_seq=ds,
-            kv_seq=enc_seq + ds,
-            stream=stream,
-        )
+        if self.use_tiny_q_attn:
+            # Split-kv attention: 32 blocks across all 16 SMs (vs FA2's 8 blocks).
+            # Phase1: grid(NH=8, KV_SPLITS=4) → 32 blocks, each reads 136KB K+V.
+            # Phase2: merge KV_SPLITS partial outputs → final BF16 result.
+            k_ptr0, v_ptr0 = self._enc_kv_layer_ptrs(i, offset_tokens=0)
+            dec_o_ptr = B["dec_tiny_attn_O"].ptr.value
+            fvk.gqa_split_kv_bf16(
+                attn_ptrs["dec_Q"], k_ptr0, v_ptr0, dec_o_ptr,
+                B["dec_attn_O_partial"].ptr.value,
+                B["dec_attn_m_partial"].ptr.value,
+                B["dec_attn_l_partial"].ptr.value,
+                ds, enc_seq + ds, DEC_NH, DEC_NKV, DEC_HD, stream)
+        else:
+            dec_o_ptr = self.attn.run(
+                "decoder", i,
+                q_seq=ds,
+                kv_seq=enc_seq + ds,
+                stream=stream,
+            )
 
         # C4: Attn output projection
         if self.use_fp8_decoder:

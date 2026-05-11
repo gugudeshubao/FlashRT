@@ -132,20 +132,22 @@ pipe = Pi05TorchFrontendRtx(
 )
 ```
 
-| cache_frames | Effective latency | Hz | Quality |
-|---|---|---|---|
-| 1 (no cache) | 132.6 ms | 7.5 Hz | pool=1 lossless |
-| **2** | **84.8 ms** | **11.8 Hz** | pool=1 lossless ← recommended |
-| 3 | 69.4 ms | 14.4 Hz | pool=1 lossless |
+| cache_frames | Full frame | Decode-only frame | Effective Hz | Quality |
+|---|---|---|---|---|
+| 1 (no cache) | 127 ms | — | **7.9 Hz** | pool=1 lossless |
+| **2** | **127 ms** | **38 ms** | **12.2 Hz** | pool=1 lossless ← recommended |
+| 3 | 127 ms | 38 ms | ~14 Hz | pool=1 lossless |
 
-Decoder-only latency: **37 ms** (vs 130 ms full). At cache_frames=2,
-the encoder K/V is at most 130 ms stale — acceptable for most
+Effective Hz for cache=2: `2 / (127 + 38) ms = 12.2 Hz`.
+Decoder-only latency: **38 ms** (vs 127 ms full). At cache_frames=2,
+the encoder K/V is at most 127 ms stale — acceptable for most
 manipulation tasks where the scene evolves slowly.
 
 **Usage:**
 ```bash
 # Via bench script
-python3 examples/orin/bench_pi05.py --preset lossless --int8 --cache-frames 2
+FVK_PI05_RTX_FORCE_INT8=1 python3 examples/orin/bench_pi05.py \
+    --preset lossless --cache-frames 2
 ```
 
 ## INT8 Presets (`FVK_PI05_RTX_FORCE_INT8=1`)
@@ -153,17 +155,17 @@ python3 examples/orin/bench_pi05.py --preset lossless --int8 --cache-frames 2
 All numbers measured on Jetson AGX Orin (SM87, 16 SMs, LPDDR5X ~204 GB/s),
 stable conditions, p50.
 
-| Preset | num_views | pool | layers | steps | p50 | Hz | Notes |
+| Preset | num_views | pool | layers | steps | p50 | Effective Hz | Notes |
 |---|---|---|---|---|---|---|---|
-| `lossless` + cache=2 | 2 | 1 | 27 | 10 | 84.8 ms | **11.8 Hz** | Lossless, K/V cached |
-| `lossless` | 2 | 1 | 27 | 10 | 133 ms | **7.5 Hz** | No quality trade-offs |
-| `balanced` | 2 | 1 | 27 | 5 | 109.6 ms | **9.1 Hz** | Fewer ODE steps |
-| `fast` | 2 | 2 | 27 | 5 | 70.9 ms | **14.1 Hz** | 2×2 vision pooling |
-| `faster` | 2 | 4 | 27 | 3 | 52.6 ms | **19.0 Hz** | 4×4 pooling + 3 steps |
-| `fastest` | 1 | 4 | 27 | 3 | 38.1 ms | **26.3 Hz** | Single camera |
-| *(custom)* | 1 | 1 | 27 | 10 | 86.7 ms | **11.5 Hz** | 1-camera lossless |
+| `lossless` + cache=2 | 2 | 1 | 27 | 10 | 127 ms full / 38 ms decode | **12.2 Hz** | ← recommended lossless |
+| `lossless` | 2 | 1 | 27 | 10 | 127 ms | **7.9 Hz** | No quality trade-offs |
+| `balanced` | 2 | 1 | 27 | 5 | 107 ms | **9.3 Hz** | Fewer ODE steps |
+| `fast` | 2 | 2 | 27 | 5 | ~71 ms | **~14 Hz** | 2×2 vision pooling |
+| `faster` | 2 | 4 | 27 | 3 | ~53 ms | **~19 Hz** | 4×4 pooling + 3 steps |
+| `fastest` | 1 | 4 | 27 | 3 | ~38 ms | **~26 Hz** | Single camera |
+| *(custom)* | 1 | 1 | 27 | 10 | ~87 ms | **~11.5 Hz** | 1-camera lossless |
 
-INT8 speedup vs BF16: **1.5× (10-step)**, up to **5.1× (fastest vs BF16 baseline)**.
+INT8 speedup vs BF16 baseline (~193 ms): **1.5× (lossless)** up to **5×+ (fastest)**.
 
 ### Usage
 
@@ -264,14 +266,20 @@ fewer steps (10→5) → pool=2 → pool=4 → fewer layers → single camera
 
 ---
 
-## Environment Variable
+## Environment Variables
 
 | Variable | Value | Effect |
 |---|---|---|
-| `FVK_PI05_RTX_FORCE_INT8` | `1` | Enable encoder + decoder + static-INT8 vision |
+| `FVK_PI05_RTX_FORCE_INT8` | `1` | Enable INT8 encoder + INT8 decoder (recommended) |
+| `FVK_PI05_RTX_INT8_ENCODER_ONLY` | `1` | INT8 encoder, BF16 decoder (slower — for testing only) |
 | *(unset)* | — | BF16 everywhere (~193ms baseline, ~5.2 Hz) |
 
 Always set `FVK_PI05_RTX_FORCE_INT8=1` on Orin for best performance.
+Vision always runs in BF16 regardless of these flags (static INT8 vision
+degrades encoder cosine from 0.991 → 0.282 and is disabled).
+
+> **Note**: `FVK_PI05_RTX_INT8_ENCODER_ONLY` is confirmed slower (+15ms)
+> because INT8 has 2× higher TOPS than BF16 even at M=10 decoder matrices.
 
 ---
 
@@ -279,9 +287,14 @@ Always set `FVK_PI05_RTX_FORCE_INT8=1` on Orin for best performance.
 
 - **Orin has 16 SMs and no native FP8** — INT8 is the best available precision
 - Encoder `gate_up` GEMM (560×32768×2048) runs at **92% GPU utilization** (ncu verified)
-  — there is very little software headroom remaining
-- ThorU (SM110) is 3× faster primarily due to **Blackwell FP8 per-SM TOPS**, not SM count
-  (ThorU: 20 SMs, Orin: 16 SMs — only 25% difference)
+  — there is very little software headroom remaining in the encoder
+- Decoder GEMMs (M=10) run at **<1% GPU utilization** — fundamental small-M limitation,
+  not improvable without architectural changes (larger chunk_size or batching)
+- Decoder cross-attention (**FA2, 103 µs/call**) is already near-optimal:
+  custom WMMA kernels (including split-kv and 2-pass full-WMMA designs) were implemented
+  and tested but all remain 37%–2.7× slower than FA2 for this shape; see `notes/`
+- ThorU (SM110) is ~3× faster primarily due to **Blackwell FP8 per-SM TOPS**, not SM count
+  (ThorU: 20 SMs, Orin: 16 SMs — only 25% difference); see `docs/deployment_orin.md`
 - Vision attention (FA2) is faster on Orin than ThorU's custom nvjet kernels for these shapes
 - See `docs/deployment_orin.md` for full nsys+ncu profiling data
 
@@ -303,10 +316,11 @@ depending on the diffusion trajectory.
 
 ### Results (real tabletop image, 5 prompts)
 
-| Configuration | Encoder K cosine vs BF16 | Assessment |
-|---|---|---|
-| Encoder + Decoder INT8, Vision BF16 | **0.991** | ✅ Excellent |
-| Encoder + Decoder + Vision static INT8 | **0.282** | ❌ Severe error |
+| Configuration | Encoder K cosine vs BF16 | p50 | Assessment |
+|---|---|---|---|
+| **Encoder INT8 + Decoder INT8, Vision BF16** | **0.991** | **127 ms** | ✅ Excellent (default) |
+| Encoder INT8 + Decoder BF16, Vision BF16 | 0.991 | 143 ms | ⚠️ Same quality, 15ms slower |
+| Encoder + Decoder + Vision static INT8 | **0.282** | — | ❌ Severe degradation (disabled) |
 
 ### Root Cause of Vision Static INT8 Failure
 
@@ -327,14 +341,15 @@ Two metrics used:
 - **Action cosine (steps=1, fixed seed)**: deterministic 1-step ODE output,
   valid for pool factor comparisons (encoder_seq changes)
 
-| Configuration | Encoder K cos | Action cos | Verdict | Hz |
+| Configuration | Encoder K cos | Action cos | Verdict | Hz (cache=1) |
 |---|---|---|---|---|
-| BF16 pool=1 (reference) | 1.000 | 1.000 | — | 5.1 |
-| **INT8 enc+dec, pool=1** | **0.991** | 0.979 | ✅ GOOD | **7.5** |
-| BF16 pool=2 | — | 0.863 | ❌ BAD | 12.6 |
-| INT8 enc+dec, pool=2 | — | 0.888 | ❌ BAD | 14.7 |
-| BF16 pool=4 | — | 0.161 | ❌ BAD | 15.5 |
-| INT8 enc+dec, pool=4 | — | 0.186 | ❌ BAD | 18.2 |
+| BF16 pool=1 (reference) | 1.000 | 1.000 | — | 5.2 |
+| **INT8 enc+dec, pool=1** | **0.991** | 0.979 | ✅ GOOD | **7.9** |
+| **INT8 enc+dec, pool=1, cache=2** | **0.991** | 0.979 | ✅ GOOD | **12.2 Hz effective** |
+| BF16 pool=2 | — | 0.863 | ❌ BAD | ~13 |
+| INT8 enc+dec, pool=2 | — | 0.888 | ❌ BAD | ~14 |
+| BF16 pool=4 | — | 0.161 | ❌ BAD | ~15 |
+| INT8 enc+dec, pool=4 | — | 0.186 | ❌ BAD | ~18 |
 | INT8 enc+dec, 20 SigLIP layers | 0.826 | — | ❌ BAD | ~10 |
 | INT8 enc+dec, 14 SigLIP layers | 0.665 | — | ❌ BAD | ~12 |
 

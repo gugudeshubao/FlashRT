@@ -129,6 +129,11 @@ extern "C" void tq_cutlass_k_combine_launch(
     const void* sr_fp32,
     const void* norm_k_fp32, const void* coef_rnorm_fp32,
     void* d_bf16, int M, int N, int K, cudaStream_t stream);
+// Tiny-q GQA decoder attention (csrc/kernels/decoder_tiny_attn.cu)
+#include "kernels/decoder_tiny_attn.cuh"
+// WMMA QK + Scalar AV split-k attention (csrc/kernels/decoder_wmma_attn.cu)
+#include "kernels/decoder_wmma_attn.cuh"
+
 extern "C" int cutlass_int8_silu_gated_bf16out(
     void const*, void const*, void const*, void const*, void const*, void*, int, int, int, cudaStream_t);
 
@@ -972,6 +977,44 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     }, py::arg("input"), py::arg("output"),
        py::arg("d_act_scale"), py::arg("d_weight_scale"),
        py::arg("n"), py::arg("stream") = 0);
+
+    m.def("gqa_wmma_split_kv_bf16",
+          [](uintptr_t Q, uintptr_t K, uintptr_t V, uintptr_t O,
+             uintptr_t O_partial, uintptr_t m_partial, uintptr_t l_partial,
+             int q_seq, int kv_seq, int NH, int NKV, int HD, uintptr_t stream) {
+              gqa_wmma_split_kv_bf16(
+                  reinterpret_cast<const __nv_bfloat16*>(Q),
+                  reinterpret_cast<const __nv_bfloat16*>(K),
+                  reinterpret_cast<const __nv_bfloat16*>(V),
+                  reinterpret_cast<__nv_bfloat16*>(O),
+                  reinterpret_cast<float*>(O_partial),
+                  reinterpret_cast<float*>(m_partial),
+                  reinterpret_cast<float*>(l_partial),
+                  q_seq, kv_seq, NH, NKV, HD, to_stream(stream));
+          },
+          py::arg("Q"), py::arg("K"), py::arg("V"), py::arg("O"),
+          py::arg("O_partial"), py::arg("m_partial"), py::arg("l_partial"),
+          py::arg("q_seq"), py::arg("kv_seq"), py::arg("NH"), py::arg("NKV"),
+          py::arg("HD"), py::arg("stream") = 0);
+
+    m.def("gqa_split_kv_bf16",
+          [](uintptr_t Q, uintptr_t K, uintptr_t V, uintptr_t O,
+             uintptr_t O_partial, uintptr_t m_partial, uintptr_t l_partial,
+             int q_seq, int kv_seq, int NH, int NKV, int HD, uintptr_t stream) {
+              gqa_split_kv_bf16(
+                  reinterpret_cast<const __nv_bfloat16*>(Q),
+                  reinterpret_cast<const __nv_bfloat16*>(K),
+                  reinterpret_cast<const __nv_bfloat16*>(V),
+                  reinterpret_cast<__nv_bfloat16*>(O),
+                  reinterpret_cast<float*>(O_partial),
+                  reinterpret_cast<float*>(m_partial),
+                  reinterpret_cast<float*>(l_partial),
+                  q_seq, kv_seq, NH, NKV, HD, to_stream(stream));
+          },
+          py::arg("Q"), py::arg("K"), py::arg("V"), py::arg("O"),
+          py::arg("O_partial"), py::arg("m_partial"), py::arg("l_partial"),
+          py::arg("q_seq"), py::arg("kv_seq"), py::arg("NH"), py::arg("NKV"),
+          py::arg("HD"), py::arg("stream") = 0);
 
     m.def("cutlass_int8_silu_gated_bf16out",
           [](uintptr_t act, uintptr_t up_w, uintptr_t act_s, uintptr_t wt_s,

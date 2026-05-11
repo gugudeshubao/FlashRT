@@ -114,22 +114,20 @@ SM87.
 All: `FVK_PI05_RTX_FORCE_INT8=1`, synthetic uint8 images (identical
 latency to real camera input), steady-state p50.
 
-| num_views | pool | vis_layers | steps | p50 | Hz |
-|---|---|---|---|---|---|
-| 2 | 1 | 27 | 10 | 132 ms | 7.6 |
-| 2 | 1 | 27 | 5 | 113 ms | 8.8 |
-| 1 | 1 | 27 | 5 | 72 ms | 13.9 |
-| 2 | 2 | 27 | 5 | 74 ms | 13.5 |
-| 2 | 2 | 27 | 3 | 67 ms | 15.0 |
-| 2 | 4 | 27 | 3 | 56 ms | 17.9 |
-| 2 | 4 | 14 | 3 | 42 ms | 23.9 |
-| 2 | 4 | 10 | 3 | 38 ms | 26.5 |
-| 1 | 4 | 27 | 2 | 38 ms | 26.6 |
-| 1 | 4 | 14 | 2 | 30 ms | 33.2 |
-| 1 | 4 | 10 | 2 | 28 ms | 35.7 |
+| num_views | pool | vis_layers | steps | cache | p50 | Effective Hz | Quality |
+|---|---|---|---|---|---|---|---|
+| 2 | 1 | 27 | 10 | 1 | 127 ms | **7.9** | lossless ✓ |
+| 2 | 1 | 27 | 10 | **2** | 127/38 ms | **12.2** | lossless ✓ ← recommended |
+| 2 | 1 | 27 | 5 | 1 | 107 ms | **9.3** | steps reduction |
+| 1 | 1 | 27 | 10 | 1 | ~87 ms | **~11.5** | 1-camera lossless |
+| 2 | 2 | 27 | 5 | 1 | ~71 ms | **~14** | cos=0.89 (needs validation) |
+| 2 | 4 | 27 | 3 | 1 | ~53 ms | **~19** | cos=0.19 (degraded) |
+| 1 | 4 | 27 | 3 | 1 | ~38 ms | **~26** | cos=0.19 (degraded) |
 
-**Recommended starting point**: `pool=1, steps=10` (7.6 Hz, lossless).
-To reach 10 Hz without pooling: `num_views=1, pool=1, steps=10` → 11.2 Hz.
+**Effective Hz for cache=2**: `2 / (full_ms + decode_only_ms)`.
+Decode-only latency: **38 ms** (vs 127 ms full forward).
+
+**Recommended starting point**: `pool=1, steps=10, cache=2` → **12.2 Hz lossless**.
 
 ### Parameter trade-offs
 
@@ -170,10 +168,10 @@ Vision runs in BF16 regardless of `FVK_PI05_RTX_FORCE_INT8=1`.
 
 ### Current Numbers (after fix)
 
-| Mode | Encoder K cosine | p50 | Hz |
-|---|---|---|---|
-| BF16 | 1.000 | 195ms | 5.1 |
-| **Enc+Dec INT8 (vision=BF16)** | **0.991** | **133ms** | **7.5** |
+| Mode | Encoder K cosine | p50 | Hz (cache=1) | Hz (cache=2) |
+|---|---|---|---|---|
+| BF16 | 1.000 | ~193ms | 5.2 | — |
+| **Enc+Dec INT8 (vision=BF16)** | **0.991** | **127ms** | **7.9** | **12.2** |
 
 ## Phase Breakdown (pool=1, 2-camera, 5-step)
 
@@ -318,3 +316,32 @@ Both machines have ~204 GB/s memory bandwidth. ThorU is faster due to:
 CUTLASS EVT (`csrc/gemm/cutlass_sm80_int8_rowwise.cu`) supports bias
 and activation epilogues on SM87, but the Gemma encoder/decoder weights
 have no bias terms (RMSNorm weight is folded into GEMM weights).
+
+---
+
+## Custom Decoder Attention Experiments (Archived)
+
+The decoder cross-attention shape (q=10, kv=532, NH=8, NKV=1, HD=256)
+was a target for optimization because FA2 launches only 8 blocks for
+16 SMs (50% SM utilization). Several custom kernels were built and
+benchmarked:
+
+| Kernel | GPU time/call | 180 calls | Pipeline p50 | Vs FA2 |
+|---|---|---|---|---|
+| **FA2 (baseline)** | **103 µs** | **18.5 ms** | **127 ms** | — |
+| Scalar 8-warp/block + shared merge | 162 µs | 29 ms | 142 ms | 1.6× slower |
+| Split-kv scalar 320 blocks | 216 µs | 39 ms | 183 ms | 2.1× slower |
+| WMMA QK + scalar AV | 283 µs | 51 ms | ~ | 2.7× slower |
+| **WMMA full 2-pass (QK+AV)** | **141 µs** | **25 ms** | **182 ms** | **1.37× slower** |
+
+**Conclusion**: FA2 on SM87 uses WMMA tensor cores, optimal register blocking,
+and pipelining — all custom kernels remain slower due to:
+- Multi-kernel launches: 32+80 blocks vs FA2's 8 (extra GPU scheduling overhead)
+- Serial per-row softmax loops (no warp-level parallelism across q_rows)
+- Extra shared memory staging (score → BF16 → WMMA fragment conversion)
+
+The FlashRT-bundled FA2 for SM87 (hdim=256, dtype=BF16, split-kv) is
+already close to the theoretical bandwidth minimum for this shape.
+All custom kernels are kept in `csrc/kernels/decoder_tiny_attn.cu` and
+`csrc/kernels/decoder_wmma_attn.cu` and are **disabled by default**
+(`use_tiny_q_attn=False`).
