@@ -19,6 +19,70 @@ FVK_PI05_RTX_FORCE_INT8=1 python3 examples/orin/bench_pi05.py \
 
 ---
 
+## Checkpoint
+
+`pi05_droid_pytorch` is a PyTorch safetensors conversion of the original
+JAX `pi05_droid` checkpoint released by Physical Intelligence via openpi.
+
+### Step 1 — Download the JAX checkpoint (~11.6 GB)
+
+```python
+# Inside the openpi project directory
+from openpi.shared import download
+
+checkpoint_dir = download.maybe_download(
+    "gs://openpi-assets/checkpoints/pi05_droid"
+)
+# Downloads to ~/.cache/openpi/openpi-assets/checkpoints/pi05_droid
+```
+
+Or with gsutil directly:
+
+```bash
+gsutil -m cp -r gs://openpi-assets/checkpoints/pi05_droid \
+    ~/.cache/openpi/openpi-assets/checkpoints/
+```
+
+### Step 2 — Convert to PyTorch safetensors (~6.8 GB output)
+
+```bash
+cd /path/to/openpi
+
+# Required patch before conversion
+cp -r ./src/openpi/models_pytorch/transformers_replace/* \
+    .venv/lib/python3.XX/site-packages/transformers/
+
+# Convert (JAX_PLATFORMS=cpu avoids GPU conflicts)
+JAX_PLATFORMS=cpu python examples/convert_jax_model_to_pytorch.py \
+    --checkpoint_dir ~/.cache/openpi/openpi-assets/checkpoints/pi05_droid \
+    --config-name pi05_droid \
+    --output-path ~/.cache/openpi/openpi-assets/checkpoints/pi05_droid_pytorch
+```
+
+### Resulting directory layout
+
+```
+pi05_droid_pytorch/
+├── config.json
+├── model.safetensors        ← FlashRT reads this
+└── assets/
+    └── droid/
+        └── norm_stats.json  ← FlashRT reads this
+```
+
+### Transfer to Orin
+
+If the converted checkpoint already exists on another machine (e.g. ThorU),
+copy it directly:
+
+```bash
+# From your laptop / jump host
+scp -r user@thorU:/path/to/pi05_droid_pytorch \
+    dog@30.78.37.77:/data/wy/orin_pi05_droid_pytorch
+```
+
+---
+
 ## Build
 
 ```bash
