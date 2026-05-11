@@ -129,6 +129,9 @@ extern "C" void tq_cutlass_k_combine_launch(
     const void* sr_fp32,
     const void* norm_k_fp32, const void* coef_rnorm_fp32,
     void* d_bf16, int M, int N, int K, cudaStream_t stream);
+extern "C" int cutlass_int8_silu_gated_bf16out(
+    void const*, void const*, void const*, void const*, void const*, void*, int, int, int, cudaStream_t);
+
 extern "C" int cutlass_int8_rowwise_bf16out(
     void const* A, void const* B, void const* act_scale, void const* weight_scale,
     void* D, int M, int N, int K, cudaStream_t stream);
@@ -969,6 +972,16 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     }, py::arg("input"), py::arg("output"),
        py::arg("d_act_scale"), py::arg("d_weight_scale"),
        py::arg("n"), py::arg("stream") = 0);
+
+    m.def("cutlass_int8_silu_gated_bf16out",
+          [](uintptr_t act, uintptr_t up_w, uintptr_t act_s, uintptr_t wt_s,
+             uintptr_t gate, uintptr_t D, int M, int N, int K, uintptr_t stream) {
+              return cutlass_int8_silu_gated_bf16out(
+                  to_ptr(act), to_ptr(up_w), to_ptr(act_s), to_ptr(wt_s),
+                  to_ptr(gate), to_ptr(D), M, N, K, to_stream(stream));
+          }, py::arg("act"), py::arg("up_w"), py::arg("act_scale"), py::arg("wt_scale"),
+             py::arg("gate_buf"), py::arg("D"), py::arg("M"), py::arg("N"), py::arg("K"),
+             py::arg("stream") = 0);
 
     m.def("cutlass_int8_rowwise_bf16out",
           [](uintptr_t A, uintptr_t B, uintptr_t act_scale, uintptr_t weight_scale,
