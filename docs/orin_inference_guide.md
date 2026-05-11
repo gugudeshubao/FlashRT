@@ -117,14 +117,46 @@ Default mode when `FVK_PI05_RTX_FORCE_INT8` is not set:
 | 2 | 1 | 27 | 10 | 195.0 ms | 5.1 Hz |
 | 2 | 1 | 27 | 5 | 170.1 ms | 5.9 Hz |
 
-### INT8 Presets (`FVK_PI05_RTX_FORCE_INT8=1`)
+### Temporal K/V Caching (`cache_frames`)
+
+Run vision+encoder only every N frames; intermediate frames replay the
+decoder only, reusing the cached encoder K/V. This achieves lossless
+quality (pool=1, no feature degradation) at higher effective throughput.
+
+```python
+pipe = Pi05TorchFrontendRtx(
+    checkpoint,
+    num_views=2,
+    num_steps=10,
+    cache_frames=2,   # full on frame 1, decode-only on frame 2, repeat
+)
+```
+
+| cache_frames | Effective latency | Hz | Quality |
+|---|---|---|---|
+| 1 (no cache) | 132.6 ms | 7.5 Hz | pool=1 lossless |
+| **2** | **84.8 ms** | **11.8 Hz** | pool=1 lossless ← recommended |
+| 3 | 69.4 ms | 14.4 Hz | pool=1 lossless |
+
+Decoder-only latency: **37 ms** (vs 130 ms full). At cache_frames=2,
+the encoder K/V is at most 130 ms stale — acceptable for most
+manipulation tasks where the scene evolves slowly.
+
+**Usage:**
+```bash
+# Via bench script
+python3 examples/orin/bench_pi05.py --preset lossless --int8 --cache-frames 2
+```
+
+## INT8 Presets (`FVK_PI05_RTX_FORCE_INT8=1`)
 
 All numbers measured on Jetson AGX Orin (SM87, 16 SMs, LPDDR5X ~204 GB/s),
 stable conditions, p50.
 
 | Preset | num_views | pool | layers | steps | p50 | Hz | Notes |
 |---|---|---|---|---|---|---|---|
-| `lossless` | 2 | 1 | 27 | 10 | 128.6 ms | **7.8 Hz** | No quality trade-offs |
+| `lossless` + cache=2 | 2 | 1 | 27 | 10 | 84.8 ms | **11.8 Hz** | Lossless, K/V cached |
+| `lossless` | 2 | 1 | 27 | 10 | 133 ms | **7.5 Hz** | No quality trade-offs |
 | `balanced` | 2 | 1 | 27 | 5 | 109.6 ms | **9.1 Hz** | Fewer ODE steps |
 | `fast` | 2 | 2 | 27 | 5 | 70.9 ms | **14.1 Hz** | 2×2 vision pooling |
 | `faster` | 2 | 4 | 27 | 3 | 52.6 ms | **19.0 Hz** | 4×4 pooling + 3 steps |
