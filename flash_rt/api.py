@@ -182,7 +182,8 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                use_p1_split_gu=None,
                num_steps=None,
                vision_pool_factor=None,
-               vision_num_layers=None):
+               vision_num_layers=None,
+               cache_frames=None):
     """Load a FlashRT model.
 
     Args:
@@ -369,6 +370,8 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             kwargs["vision_pool_factor"] = vision_pool_factor
         if vision_num_layers is not None and "vision_num_layers" in sig.parameters:
             kwargs["vision_num_layers"] = vision_num_layers
+        if cache_frames is not None and "cache_frames" in sig.parameters:
+            kwargs["cache_frames"] = cache_frames
         # FP4 frontend accepts these extra kwargs (only set when the class
         # actually accepts them — base class ignores, FP4 subclass uses).
         if use_fp4 and "use_fp4_encoder_ffn" in sig.parameters:

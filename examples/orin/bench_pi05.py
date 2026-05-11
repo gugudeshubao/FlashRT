@@ -61,6 +61,8 @@ def parse_args():
                    help="Enable INT8 encoder/decoder/vision (sets FVK_PI05_RTX_FORCE_INT8=1)")
     p.add_argument("--no-int8", dest="int8", action="store_false",
                    help="Disable INT8, run BF16 (default)")
+    p.add_argument("--cache-frames", type=int, default=1,
+                   help="Temporal K/V cache: run full pipeline every N frames (1=off)")
     return p.parse_args()
 
 
@@ -98,6 +100,7 @@ def main():
         num_steps=args.steps,
         vision_pool_factor=args.pool,
         vision_num_layers=args.layers,
+        cache_frames=args.cache_frames,
     )
 
     pipe.set_prompt(args.prompt)

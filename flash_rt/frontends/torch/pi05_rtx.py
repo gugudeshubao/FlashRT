@@ -446,13 +446,20 @@ class Pi05TorchFrontendRtx:
                  max_prompt_len: int = MAX_PROMPT_LEN_DEFAULT,
                  num_steps: int = NUM_STEPS_DEFAULT,
                  vision_pool_factor: int = 1,
-                 vision_num_layers: Optional[int] = None):
+                 vision_num_layers: Optional[int] = None,
+                 cache_frames: int = 1):
         checkpoint_dir = pathlib.Path(checkpoint_dir)
         self.num_views = int(num_views)
         self.chunk_size = int(chunk_size)
         self.max_prompt_len = int(max_prompt_len)
         self._num_steps = int(num_steps)
         self._vision_pool_factor = int(vision_pool_factor)
+        # Temporal K/V caching: run full pipeline every `cache_frames` frames,
+        # intermediate frames reuse the cached encoder K/V (decoder-only).
+        # cache_frames=1 (default) = no caching, every frame is full.
+        # cache_frames=2 = full, decode, full, decode, ...
+        self._cache_frames = max(1, int(cache_frames))
+        self._frame_count = 0
         from flash_rt.models.pi05.pipeline_rtx import VIS_L as _VIS_L
         self._vision_num_layers = _VIS_L if vision_num_layers is None else int(vision_num_layers)
         # _use_int8_vision_static is set after _force_int8_decoder below
@@ -1325,19 +1332,29 @@ class Pi05TorchFrontendRtx:
 
         t0 = time.perf_counter()
 
+        # Temporal K/V caching: every cache_frames-th frame runs the full
+        # pipeline (vision + encoder + decoder); intermediate frames skip
+        # vision and encoder and replay only the decoder with fresh noise,
+        # reusing the encoder K/V cache from the last full forward.
+        self._frame_count += 1
+        use_full = (self._cache_frames <= 1 or
+                    self._frame_count % self._cache_frames == 1)
+
         with torch.cuda.stream(self._graph_torch_stream):
             stream_int = self._graph_torch_stream.cuda_stream
 
-            self._fill_img_buf(observation)
             self._noise_buf.normal_()
-
-            self._copy_tensor_to_pipeline_buf_stream(
-                self._img_buf, self.pipeline.input_images_buf, stream_int)
             self._copy_tensor_to_pipeline_buf_stream(
                 self._noise_buf, self.pipeline.input_noise_buf, stream_int)
 
-            # Graph replay (on the same captured stream)
-            out_ptr = self.pipeline.forward()
+            if use_full:
+                self._fill_img_buf(observation)
+                self._copy_tensor_to_pipeline_buf_stream(
+                    self._img_buf, self.pipeline.input_images_buf, stream_int)
+                out_ptr = self.pipeline.forward()
+            else:
+                # Decode-only: skip vision+encoder, reuse cached K/V
+                out_ptr = self.pipeline.forward_decode_only()
 
             # D2D download → staging torch tensor
             self._cudart.cudaMemcpyAsync(

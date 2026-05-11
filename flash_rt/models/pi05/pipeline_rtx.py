@@ -229,6 +229,7 @@ class Pi05Pipeline:
 
         # CUDA graph state (set by record_infer_graph)
         self._graph = None
+        self._decoder_only_graph = None  # for temporal K/V caching
         self._graph_stream = None  # ctypes.c_void_p
         self._cudart = ctypes.CDLL("libcudart.so")
         # Keep libcudart call signatures explicit. Some aarch64 Python
@@ -1674,12 +1675,26 @@ class Pi05Pipeline:
             self.run_pipeline(stream=stream_int)
         self._cudart.cudaStreamSynchronize(stream_handle)
 
-        # Capture
+        # Capture full pipeline
         self._graph.begin_capture(stream_handle)
         self.run_pipeline(stream=stream_int)
         self._graph.end_capture(stream_handle)
         self._cudart.cudaStreamSynchronize(stream_handle)
         logger.info("CUDA Graph captured for Pi05Pipeline")
+
+        # Also capture a decoder-only graph for temporal K/V caching.
+        # This graph skips vision_encoder + transformer_encoder and runs only
+        # transformer_decoder, reusing the K/V cache from the last full forward.
+        # The language embeds and encoder K/V buffers are left intact.
+        self._decoder_only_graph = CUDAGraph()
+        for _ in range(3):
+            self.transformer_decoder(stream=stream_int)
+        self._cudart.cudaStreamSynchronize(stream_handle)
+        self._decoder_only_graph.begin_capture(stream_handle)
+        self.transformer_decoder(stream=stream_int)
+        self._decoder_only_graph.end_capture(stream_handle)
+        self._cudart.cudaStreamSynchronize(stream_handle)
+        logger.info("CUDA Graph captured for Pi05Pipeline (decoder-only)")
 
     # ══════════════════════════════════════════════════════════════════
     #   Public API
@@ -1761,5 +1776,23 @@ class Pi05Pipeline:
             self._cudart.cudaStreamSynchronize(self._graph_stream)
         else:
             self.run_pipeline(stream=0)
+            self._cudart.cudaDeviceSynchronize()
+        return self.bufs["diffusion_noise"].ptr.value
+
+    def forward_decode_only(self) -> int:
+        """Replay the decoder-only graph for temporal K/V caching.
+
+        Skips vision_encoder + transformer_encoder and runs only
+        transformer_decoder, reusing the encoder K/V cache from the last
+        full :meth:`forward` call. The frontend must write fresh noise into
+        ``input_noise_buf`` before calling this.
+
+        Returns the device pointer of ``diffusion_noise`` (final actions).
+        """
+        if hasattr(self, "_decoder_only_graph") and self._decoder_only_graph is not None:
+            self._decoder_only_graph.replay(self._graph_stream)
+            self._cudart.cudaStreamSynchronize(self._graph_stream)
+        else:
+            self.transformer_decoder(stream=0)
             self._cudart.cudaDeviceSynchronize()
         return self.bufs["diffusion_noise"].ptr.value
