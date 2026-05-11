@@ -286,16 +286,36 @@ the Gemma encoder and corrupts the decoder's cross-attention context.
 **Fix**: vision static INT8 (`use_int8_vision_static`) is now disabled.
 Vision always runs in BF16 regardless of `FVK_PI05_RTX_FORCE_INT8`.
 
-### Current Precision + Performance (after fix)
+### Precision Sweep Results
 
-| Mode | Encoder K cosine | p50 | Hz |
-|---|---|---|---|
-| BF16 baseline | 1.000 | 195ms | 5.1 Hz |
-| **INT8 (enc+dec, vision=BF16)** | **0.991** | **133ms** | **7.5 Hz** |
+Measured on real tabletop image, 4 prompts.
+Two metrics used:
+- **Encoder K cosine**: compares encoder features directly (no diffusion noise),
+  valid for pool=1 comparisons
+- **Action cosine (steps=1, fixed seed)**: deterministic 1-step ODE output,
+  valid for pool factor comparisons (encoder_seq changes)
 
-The 0.9% residual error in encoder features comes from the
-encoder's own per-row dynamic INT8 activation quantization —
-this is expected and acceptable for a W8A8 scheme.
+| Configuration | Encoder K cos | Action cos | Verdict | Hz |
+|---|---|---|---|---|
+| BF16 pool=1 (reference) | 1.000 | 1.000 | — | 5.1 |
+| **INT8 enc+dec, pool=1** | **0.991** | 0.979 | ✅ GOOD | **7.5** |
+| BF16 pool=2 | — | 0.863 | ❌ BAD | 12.6 |
+| INT8 enc+dec, pool=2 | — | 0.888 | ❌ BAD | 14.7 |
+| BF16 pool=4 | — | 0.161 | ❌ BAD | 15.5 |
+| INT8 enc+dec, pool=4 | — | 0.186 | ❌ BAD | 18.2 |
+| INT8 enc+dec, 20 SigLIP layers | 0.826 | — | ❌ BAD | ~10 |
+| INT8 enc+dec, 14 SigLIP layers | 0.665 | — | ❌ BAD | ~12 |
+
+**Key findings:**
+- `pool=1` (no token pooling) is the only numerically safe configuration
+- `pool=2` degrades action cosine to 0.86-0.89 — moderate accuracy loss
+- `pool=4` is catastrophic (cos=0.16-0.19) — features completely scrambled
+- Reducing SigLIP layers also degrades quickly: 20L→0.83, 14L→0.67
+
+Note: these metrics measure the **direction** of change, not absolute task
+success rate. Whether pool=2 (cos=0.88) is acceptable depends on the task —
+some manipulation tasks are robust to this level of feature degradation.
+**Real robot validation is required for pool>1 configurations.**
 
 ### Benchmark Script
 
