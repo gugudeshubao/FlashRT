@@ -293,8 +293,10 @@ class Pi05Pipeline:
         B["encoder_x_norm"] = CudaBuffer.device_empty(es * ENC_D, BF16)
         B["encoder_QKV"] = CudaBuffer.device_empty(es * (ENC_NH + 2 * ENC_NKV) * ENC_HD, BF16)
         B["encoder_hidden"] = CudaBuffer.device_empty(es * ENC_H, BF16)
-        # Merged gate+up output for fused FFN: seq * 2 * H
+        # Merged gate+up output (legacy BF16 path) or gate-only buffer for SiLU-gated.
         B["encoder_gate_merged"] = CudaBuffer.device_empty(es * 2 * ENC_H, BF16)
+        # Gate buffer for SiLU-gated EVT fusion (encoder): (es, ENC_H) BF16
+        B["encoder_gate_buf"] = CudaBuffer.device_empty(es * ENC_H, BF16)
 
         # ── Decoder (Gemma-300M) ──
         B["decoder_rope_weights"] = CudaBuffer.device_empty(ds * 256, BF16)
@@ -313,6 +315,8 @@ class Pi05Pipeline:
             ds * (DEC_NH + 2 * DEC_NKV) * DEC_HD, BF16)
         B["decoder_hidden"] = CudaBuffer.device_empty(ds * DEC_H, BF16)
         B["decoder_gate_merged"] = CudaBuffer.device_empty(ds * 2 * DEC_H, BF16)
+        # Gate buffer for SiLU-gated EVT fusion (decoder): (ds, DEC_H) BF16
+        B["decoder_gate_buf"] = CudaBuffer.device_empty(ds * DEC_H, BF16)
         B["diffusion_noise"] = CudaBuffer.device_empty(ds * ACTION_DIM, BF16)
         # Decoder scratch for ada_rms_norm output + gate
         B["x_normed_buf"] = CudaBuffer.device_empty(ds * DEC_D, BF16)
@@ -1097,23 +1101,35 @@ class Pi05Pipeline:
                 B["encoder_x_norm"].ptr.value,
                 seq, ENC_D, ENC_D, stream=stream)
 
-        # B4: (residual_add + RMSNorm) fused → INT8 gate_up GEMM
+        # B4: (residual_add + RMSNorm) fused → INT8 gate GEMM + SiLU-gated up GEMM
         if use_int8_enc:
-            # Fused: x += x_norm (attn_o); RMSNorm(x) → INT8 for gate_up.
-            # Saves 2 extra BW passes vs separate residual_add+rms_norm+quantize.
-            gu_name = f"encoder_ffn_gate_up_w_{i}"
-            layer_scale_gu = self._int8_scale_buf(gu_name, seq)
+            # Fused: x += x_norm (attn_o); RMSNorm(x) → INT8.
+            # Gate and up are quantized from the same activation (act_i8, act_scale).
+            # Gate GEMM writes gate_buf; up GEMM + SiLU-gated EVT writes hidden
+            # directly — eliminating the separate gate_geglu_merged kernel.
+            gate_name = f"encoder_ffn_gate_w_{i}"
+            up_name   = f"encoder_ffn_up_w_{i}"
+            act_scale = self._int8_scale_buf(gate_name, seq)
             act_i8_ptr = self._pick_enc_int8_scratch(seq * ENC_D)
             fvk.residual_add_rms_norm_int8_rowwise(
                 B["encoder_x"].ptr.value, B["encoder_x_norm"].ptr.value,
                 self._rms_ones_enc.ptr.value,
-                act_i8_ptr, layer_scale_gu.ptr.value,
+                act_i8_ptr, act_scale.ptr.value,
                 seq, ENC_D, 1e-6, stream=stream)
+            # Gate GEMM → gate_buf (seq, ENC_H)
             self._int8_gemm_fused(
-                act_i8_ptr, gu_name,
-                B["encoder_gate_merged"].ptr.value,
-                seq, 2 * ENC_H, ENC_D,
-                layer_scale_gu.ptr.value, stream)
+                act_i8_ptr, gate_name,
+                B["encoder_gate_buf"].ptr.value,
+                seq, ENC_H, ENC_D,
+                act_scale.ptr.value, stream)
+            # Up GEMM + SiLU(gate)*up in EVT epilogue → encoder_hidden (seq, ENC_H)
+            up_w_ptr, up_wt_scale_ptr = self._weight_int8(up_name)
+            fvk.cutlass_int8_silu_gated_bf16out(
+                act_i8_ptr, up_w_ptr,
+                act_scale.ptr.value, up_wt_scale_ptr,
+                B["encoder_gate_buf"].ptr.value,
+                B["encoder_hidden"].ptr.value,
+                seq, ENC_H, ENC_D, stream=stream)
         elif fused:
             # Fused: residual + RMS → FP8 in one kernel, then FP8 GEMM
             gu_name = f"encoder_ffn_gate_up_w_{i}"
@@ -1159,12 +1175,11 @@ class Pi05Pipeline:
                 B["encoder_hidden"].ptr.value,
                 seq, ENC_H, ENC_D, stream=stream)
 
-        # SiLU(gate) * up → hidden, then FFN down
+        # SiLU(gate) * up → hidden (already done by silu_gated EVT above for INT8),
+        # then FFN down GEMM.
         if use_int8_enc:
-            fvk.gate_geglu_merged(
-                B["encoder_gate_merged"].ptr.value,
-                B["encoder_hidden"].ptr.value,
-                seq, ENC_H, stream=stream)
+            # encoder_hidden already has SiLU(gate)*up from the EVT kernel above.
+            # Just run the down projection.
             self._enc_int8_gemm(
                 B["encoder_hidden"].ptr.value, seq * ENC_H,
                 f"encoder_ffn_down_w_{i}",
@@ -1362,8 +1377,10 @@ class Pi05Pipeline:
                 B["x_normed_buf"].ptr.value,
                 ds, DEC_D, DEC_NH * DEC_HD, stream=stream)
 
-        # C4→C5: gate*residual + AdaRMSNorm + FFN gate_up
-        gu_name = f"decoder_ffn_gate_up_w_{i}"
+        # C4→C5: gate*residual + AdaRMSNorm + FFN gate_up (fused SiLU-gated for INT8)
+        gu_name   = f"decoder_ffn_gate_up_w_{i}"    # FP8/BF16 merged name (legacy)
+        gate_name = f"decoder_ffn_gate_w_{i}"       # INT8 separate gate
+        up_name   = f"decoder_ffn_up_w_{i}"         # INT8 separate up
         if fused:
             act_scale_gu = self.fp8_act_scales[gu_name].ptr.value
             fvk.gate_residual_ada_norm_fp8(
@@ -1404,11 +1421,23 @@ class Pi05Pipeline:
                     B["decoder_gate_merged"].ptr.value,
                     ds, 2 * DEC_H, DEC_D, stream)
             elif self.use_int8_decoder:
+                # INT8: separate gate GEMM → decoder_gate_buf,
+                #       up GEMM + SiLU-gated EVT → decoder_hidden.
+                #       Eliminates gate_geglu_merged (C6).
+                act_scale_gu_ptr = self._int8_scale_buf(gate_name, ds).ptr.value
+                act_i8 = B["dec_act_int8"].ptr.value
                 self._int8_gemm_fused(
-                    B["dec_act_int8"].ptr.value, gu_name,
-                    B["decoder_gate_merged"].ptr.value,
-                    ds, 2 * DEC_H, DEC_D,
-                    self._int8_scale_buf(gu_name, ds).ptr.value, stream)
+                    act_i8, gate_name,
+                    B["decoder_gate_buf"].ptr.value,
+                    ds, DEC_H, DEC_D,
+                    act_scale_gu_ptr, stream)
+                up_w_ptr, up_wt_s_ptr = self._weight_int8(up_name)
+                fvk.cutlass_int8_silu_gated_bf16out(
+                    act_i8, up_w_ptr,
+                    act_scale_gu_ptr, up_wt_s_ptr,
+                    B["decoder_gate_buf"].ptr.value,
+                    B["decoder_hidden"].ptr.value,
+                    ds, DEC_H, DEC_D, stream=stream)
             else:
                 gemm.bf16_nn(
                     B["x_normed_buf"].ptr.value, W["decoder_ffn_gate_w"][i],
@@ -1442,10 +1471,8 @@ class Pi05Pipeline:
                 B["x_normed_buf"].ptr.value,
                 ds, DEC_D, DEC_H, stream)
         elif self.use_int8_decoder:
-            fvk.gate_geglu_merged(
-                B["decoder_gate_merged"].ptr.value,
-                B["decoder_hidden"].ptr.value,
-                ds, DEC_H, stream=stream)
+            # decoder_hidden already filled by SiLU-gated EVT in C4→C5.
+            # Skip gate_geglu_merged — go directly to down GEMM.
             self._int8_gemm(
                 B["decoder_hidden"].ptr.value, ds * DEC_H,
                 down_name,

@@ -699,10 +699,9 @@ class Pi05TorchFrontendRtx:
         for i in range(DEC_L):
             quant(f"decoder_attn_qkv_w_{i}", W["decoder_attn_qkv_w"][i])
             quant(f"decoder_attn_o_w_{i}", W["decoder_attn_o_w"][i])
-            gate_up = torch.cat(
-                [W["decoder_ffn_gate_w"][i], W["decoder_ffn_up_w"][i]], dim=1
-            ).contiguous()
-            quant(f"decoder_ffn_gate_up_w_{i}", gate_up)
+            # Separate gate and up for SiLU-gated EVT fusion (same as encoder).
+            quant(f"decoder_ffn_gate_w_{i}", W["decoder_ffn_gate_w"][i])
+            quant(f"decoder_ffn_up_w_{i}", W["decoder_ffn_up_w"][i])
             quant(f"decoder_ffn_down_w_{i}", W["decoder_ffn_down_w"][i])
 
         logger.info("INT8 quantized %d decoder GEMM weights", len(int8_weights))
@@ -740,15 +739,15 @@ class Pi05TorchFrontendRtx:
         for i in range(ENC_L):
             quant(f"encoder_attn_qkv_w_{i}", W["encoder_attn_qkv_w"][i])
             quant(f"encoder_attn_o_w_{i}", W["encoder_attn_o_w"][i])
-            # Merge gate+up into a single (ENC_D, 2*ENC_H) tensor — mirrors
-            # the FP8 path so the pipeline can use gate_geglu_merged.
-            gate_up = torch.cat(
-                [W["encoder_ffn_gate_w"][i], W["encoder_ffn_up_w"][i]], dim=1
-            ).contiguous()
-            quant(f"encoder_ffn_gate_up_w_{i}", gate_up)
+            # Keep gate and up SEPARATE for SiLU-gated EVT fusion.
+            # The new cutlass_int8_silu_gated_bf16out kernel reads gate_buf
+            # produced by the gate GEMM and fuses SiLU(gate)*up in the
+            # epilogue, eliminating the separate gate_geglu_merged kernel.
+            quant(f"encoder_ffn_gate_w_{i}", W["encoder_ffn_gate_w"][i])
+            quant(f"encoder_ffn_up_w_{i}", W["encoder_ffn_up_w"][i])
             quant(f"encoder_ffn_down_w_{i}", W["encoder_ffn_down_w"][i])
 
-        logger.info("INT8 quantized %d encoder GEMM weights", 4 * ENC_L)
+        logger.info("INT8 quantized %d encoder GEMM weights", 5 * ENC_L)
 
     def _quantize_vision_int8(self) -> None:
         """Pre-quantize the SigLIP vision encoder GEMM weights to INT8.
