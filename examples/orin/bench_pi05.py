@@ -71,6 +71,10 @@ def parse_args():
                    help="Use custom warp-per-(q,h) decoder cross-attention instead of FA2")
     p.add_argument("--int8-encoder-only", action="store_true", default=False,
                    help="INT8 encoder + BF16 decoder (tests M=10 cuBLAS BF16 vs INT8 CUTLASS)")
+    p.add_argument("--pipelined", action="store_true", default=False,
+                   help="Dual-stream pipelined inference (encoder for frame N || "
+                        "decoder for frame N-1). Lossless vs cache=1 baseline; "
+                        "1 frame of action delay. Targets ~11.5 Hz on Orin.")
     return p.parse_args()
 
 
@@ -128,15 +132,19 @@ def main():
     print("Calibrating…")
     pipe.calibrate_with_real_data([obs])
 
+    infer_fn = pipe.infer_pipelined if args.pipelined else pipe.infer
+    if args.pipelined:
+        print("Pipelined mode: dual-stream encoder ‖ decoder, 1-frame action delay")
+
     print(f"Warmup ({args.warmup} iters)…")
     for _ in range(args.warmup):
-        pipe.infer(obs)
+        infer_fn(obs)
 
     print(f"Measuring ({args.reps} iters)…")
     lat = []
     for _ in range(args.reps):
         t0 = time.perf_counter()
-        out = pipe.infer(obs)
+        out = infer_fn(obs)
         lat.append((time.perf_counter() - t0) * 1000)
 
     lat.sort()

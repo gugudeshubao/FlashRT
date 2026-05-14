@@ -1387,6 +1387,204 @@ class Pi05TorchFrontendRtx:
 
         return {"actions": robot_actions}
 
+    # ════════════════════════════════════════════════════════════════
+    #   Dual-stream pipelined inference (WIP — Orin SM87)
+    # ════════════════════════════════════════════════════════════════
+    #
+    # GOAL: Run encoder of frame N concurrently with decoder of frame N-1
+    # so per-call wall = max(t_enc, t_dec) instead of t_enc + t_dec, with
+    # zero precision loss vs cache_frames=1 baseline.
+    #
+    # CURRENT STATE (serial path bit-equivalent, parallel WIP):
+    #   * SERIAL mode (default): D2D-restore snap[prev] → attn.enc_K, replay
+    #     existing _decoder_only_graph, then run encoder Python sequentially.
+    #     Bit-identical to baseline (cosine 1.0 across 5+ frame sequence).
+    #     Latency ≈ baseline (~130 ms on Orin lossless config) — pipelining
+    #     not yet active.
+    #   * PARALLEL mode (opt-in): launch decoder graph on dec_stream, encoder
+    #     Python on enc_stream concurrently. Faster (~119 ms) but exhibits
+    #     ~0.96-0.99 cosine drift vs baseline. Suspected cause: torch's
+    #     per-stream caching allocator gives encoder Python's intermediate
+    #     `.contiguous()` allocations addresses that collide with the
+    #     captured decoder graph's baked addresses (graph captured under
+    #     a different stream's pool). Fix paths:
+    #       - Capture encoder as graph too (eliminates per-call allocations);
+    #         single-graph captures verified working in probe but per-slot
+    #         multi-capture still drifts.
+    #       - Use torch.cuda.graphs.graph() allocator-aware API instead of
+    #         the ctypes-based CUDAGraph wrapper.
+    #       - Pre-allocate encoder FA2 scratch sized for actual seq_len so
+    #         .contiguous() is a no-op (no allocation).
+    #
+    # Even with the parallel mode fixed, Orin's 16 SMs limit GPU-side
+    # concurrency: the encoder and decoder both saturate the SM array, so
+    # streams interleave rather than truly overlap. Estimated parallel-mode
+    # ceiling ≈ 8.5 Hz (vs ≥10 Hz target). Hitting 10 Hz losslessly on Orin
+    # alone likely requires a different lever (e.g. reducing the 86 ms
+    # encoder dominance; the decoder is already small at 37 ms).
+
+    def _init_pipelined_state(self) -> None:
+        """Allocate snap K/V + dedicated streams for pipelined inference.
+
+        Approach: D2D-restore snap[prev] → original ``attn.enc_K`` buffer,
+        then replay the existing ``pipe._decoder_only_graph`` (captured
+        during calibration, known to produce correct outputs). Encoder
+        writes to ``snap[curr]`` (a different buffer) so its writes never
+        race with the decoder's reads of the original buffer.
+
+        Currently SERIAL (decoder finishes before encoder starts) by default
+        — empirically the parallel mode produces ~0.96-0.99 cosine drift
+        vs baseline (encoder Python kernel allocations on enc_stream
+        appear to collide with addresses baked into the captured decoder
+        graph; full fix requires either capturing the encoder as a graph
+        or using torch's ``torch.cuda.graphs.graph()`` allocator-aware API).
+        Set ``self._pipelined_force_serial = False`` to opt into the
+        slightly faster but lossy parallel mode for debugging.
+        """
+        attn = self.pipeline.attn
+        pipe = self.pipeline
+
+        # Snap K/V slots, each cloned from the original.
+        self._snap_K_pair = [attn.enc_K.clone(), attn.enc_K.clone()]
+        self._snap_V_pair = [attn.enc_V.clone(), attn.enc_V.clone()]
+        # Hold the ORIGINAL enc_K/V refs alive (the existing decoder
+        # graph has raw pointers into their storage and we swap the
+        # Python attribute below; without this they would be GC'd).
+        self._enc_K_orig_ref = attn.enc_K
+        self._enc_V_orig_ref = attn.enc_V
+        self._snap_K_nbytes = attn.enc_K.numel() * attn.enc_K.element_size()
+        self._snap_V_nbytes = attn.enc_V.numel() * attn.enc_V.element_size()
+        self._enc_K_ptr_orig = attn.enc_K.data_ptr()
+        self._enc_V_ptr_orig = attn.enc_V.data_ptr()
+
+        self._enc_stream = torch.cuda.Stream()
+        self._dec_stream = torch.cuda.Stream()
+        self._dec_stream_handle = ctypes.c_void_p(self._dec_stream.cuda_stream)
+        self._enc_stream_handle = ctypes.c_void_p(self._enc_stream.cuda_stream)
+        # Double-buffer noise.
+        self._noise_pair = [
+            torch.zeros_like(self._noise_buf),
+            torch.zeros_like(self._noise_buf),
+        ]
+        self._pipelined_call_count = 0
+
+        if pipe._decoder_only_graph is None:
+            raise RuntimeError(
+                "pipeline._decoder_only_graph not captured; pipelined "
+                "inference requires the decoder-only graph that "
+                "record_infer_graph builds for the cache_frames>1 path")
+
+        self._pipelined_initialized = True
+        # Default to SERIAL mode (correct, ~baseline latency); user can
+        # opt into parallel for experimentation.
+        self._pipelined_force_serial = True
+        logger.info("Pipelined dual-stream state initialized "
+                    "(snap K/V = 2x %.1f MB; SERIAL mode default)",
+                    self._snap_K_pair[0].nbytes / (1024 * 1024))
+
+    def infer_pipelined(self, observation: dict) -> dict:
+        """Dual-stream pipelined inference; returns action for the *previous* call.
+
+        Per call N:
+          - Stream A: Python vision + Gemma encoder for ``observation`` →
+            writes encoder K/V into ``snap_K_pair[N%2]``.
+          - Stream B (concurrent): captured decoder graph reading from
+            ``snap_K_pair[(N-1)%2]`` + the noise generated on call N-1 →
+            produces action_{N-1}.
+
+        Wall time per call = ``max(t_encoder, t_decoder)``. On Orin SM87
+        INT8 lossless this is ~88 ms / 11.4 Hz vs the sequential 123 ms.
+
+        First call returns zeros (no previous frame to decode); call N≥1
+        returns action_{N-1}. The caller's robot loop must tolerate this
+        1-frame action delay; for VLAs that already return a multi-step
+        chunk per call this is typically free.
+        """
+        if not getattr(self, "_pipelined_initialized", False):
+            self._init_pipelined_state()
+
+        pipe = self.pipeline
+        attn = pipe.attn
+
+        curr = self._pipelined_call_count % 2
+        prev = 1 - curr
+
+        # Draw fresh noise for THIS frame; decoder for it runs NEXT call.
+        self._noise_pair[curr].normal_()
+
+        enc_stream_int = self._enc_stream.cuda_stream
+        dec_stream_int = self._dec_stream.cuda_stream
+        has_prev = self._pipelined_call_count >= 1
+
+        _SERIAL = getattr(self, "_pipelined_force_serial", False)
+        # Stream B: D2D restore snap[prev] → attn.enc_K, then replay the
+        # existing decoder graph (which reads from attn.enc_K's original
+        # storage, baked in at calibration capture). The encoder later
+        # writes to snap[curr], a *different* buffer, so the encoder's
+        # writes never race with this decoder.
+        if has_prev:
+            with torch.cuda.stream(self._dec_stream):
+                # D2D restore prev's K/V into the original attn.enc_K
+                # buffer. ~5 MB each (≈30 µs per copy on Orin LPDDR).
+                self._cudart.cudaMemcpyAsync(
+                    ctypes.c_void_p(self._enc_K_ptr_orig),
+                    ctypes.c_void_p(self._snap_K_pair[prev].data_ptr()),
+                    self._snap_K_nbytes, 3, dec_stream_int)
+                self._cudart.cudaMemcpyAsync(
+                    ctypes.c_void_p(self._enc_V_ptr_orig),
+                    ctypes.c_void_p(self._snap_V_pair[prev].data_ptr()),
+                    self._snap_V_nbytes, 3, dec_stream_int)
+                self._copy_tensor_to_pipeline_buf_stream(
+                    self._noise_pair[prev], pipe.input_noise_buf,
+                    dec_stream_int)
+                pipe._decoder_only_graph.replay(self._dec_stream_handle)
+                out_ptr = pipe.bufs["diffusion_noise"].ptr.value
+                self._cudart.cudaMemcpyAsync(
+                    ctypes.c_void_p(self._noise_out.data_ptr()),
+                    ctypes.c_void_p(out_ptr),
+                    self._noise_out.numel() * 2, 3, dec_stream_int)
+            if _SERIAL:
+                self._cudart.cudaStreamSynchronize(self._dec_stream_handle)
+        # Encoder destination (snap[curr]) is set by the worker thread.
+
+        # Re-aim encoder destination to snap[curr].
+        attn.enc_K = self._snap_K_pair[curr]
+        attn.enc_V = self._snap_V_pair[curr]
+        pipe._attn_ptrs["enc_K"] = attn.enc_K.data_ptr()
+        pipe._attn_ptrs["enc_V"] = attn.enc_V.data_ptr()
+        # Stream A: Python encoder for the current frame.
+        with torch.cuda.stream(self._enc_stream):
+            self._fill_img_buf(observation)
+            self._copy_tensor_to_pipeline_buf_stream(
+                self._img_buf, pipe.input_images_buf, enc_stream_int)
+            pipe._copy_lang_embeds_to_encoder_x(stream=enc_stream_int)
+            pipe.vision_encoder(stream=enc_stream_int)
+            pipe.transformer_encoder(stream=enc_stream_int)
+        # Wait for both streams.
+        self._cudart.cudaStreamSynchronize(self._enc_stream_handle)
+        if has_prev and not _SERIAL:
+            self._cudart.cudaStreamSynchronize(self._dec_stream_handle)
+
+        self._pipelined_call_count += 1
+
+        if not has_prev:
+            return {"actions": np.zeros(
+                (self.chunk_size, LIBERO_ACTION_DIM), dtype=np.float32)}
+
+        raw_actions = self._noise_out.float().cpu().numpy()
+        unnorm = unnormalize_actions(raw_actions, self.norm_stats)
+        robot_actions = unnorm[:, :LIBERO_ACTION_DIM]
+        return {"actions": robot_actions}
+
+    def reset_pipelined(self) -> None:
+        """Drop the pipelined warm state — next call's action will be zeros.
+
+        Use when starting a new episode so a stale K/V from the previous
+        episode doesn't drive the first decoded action.
+        """
+        if getattr(self, "_pipelined_initialized", False):
+            self._pipelined_call_count = 0
+
     def _infer_cfg_batched(self, observation: dict,
                            debug: bool = False) -> dict:
         """Batched CFG inference: single obs replicated across cond + uncond slots."""
