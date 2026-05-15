@@ -326,6 +326,62 @@ void quantize_int8_rowwise(const __nv_bfloat16* input, int8_t* output,
         input, output, d_scales, rows, cols);
 }
 
+// ── Static per-row INT8 quantization (pre-calibrated scales, single-pass) ──
+//
+// Drop-in replacement for quantize_int8_rowwise when the per-row scale
+// buffer has been pre-filled at calibration time. Skips the per-row
+// amax reduction (warp shuffle + cross-warp shared-memory merge) and
+// the second pass over global memory; reads each input element once,
+// quantizes against the pre-computed scale, writes once.
+//
+// Memory traffic per row: 1 BF16 read (cols * 2 B) + 1 INT8 write
+// (cols * 1 B) = 3*cols B  vs the dynamic version's 5*cols B.
+// Compute per row: 1 fmax (clamp), 1 mul, 1 cvt — no warp shuffles.
+//
+// Calibration must guarantee the per-row scales bound the per-call
+// activation magnitude (max over calibration samples). The frontend
+// can either:
+//   (a) freeze the dynamic per-row scales from one calibration call
+//       (works when row N's distribution is stable across calls — true
+//       for prompt rows, approximately true for vision rows on stable
+//       camera setups), or
+//   (b) fill all rows with a single per-tensor max scalar (loses some
+//       per-row precision but trivially safe).
+__global__ void quantize_int8_rowwise_static_kernel(
+        const __nv_bfloat16* __restrict__ input,
+        int8_t*  __restrict__ output,
+        const float* __restrict__ scales,   // (rows,) — one scalar per row
+        int rows, int cols)
+{
+    int row = blockIdx.x;
+    if (row >= rows) return;
+
+    const __nv_bfloat16* in_row = input + static_cast<size_t>(row) * cols;
+    int8_t* out_row = output + static_cast<size_t>(row) * cols;
+
+    // Read scale once per block via __ldg (treated as constant during
+    // this kernel call). The 1e-12f floor mirrors the dynamic kernel
+    // and guards against degenerate calibration values.
+    float inv_s = 1.0f / fmaxf(__ldg(&scales[row]), 1e-12f);
+
+    for (int j = threadIdx.x; j < cols; j += blockDim.x) {
+        float v = __bfloat162float(in_row[j]) * inv_s;
+        int q = __float2int_rn(v);
+        q = (q < -127) ? -127 : ((q > 127) ? 127 : q);
+        out_row[j] = static_cast<int8_t>(q);
+    }
+}
+
+void quantize_int8_rowwise_static(const __nv_bfloat16* input, int8_t* output,
+                                   const float* d_scales, int rows, int cols,
+                                   cudaStream_t stream) {
+    int threads = (cols < 256) ? cols : 256;
+    threads = ((threads + 31) / 32) * 32;
+    if (threads < 32) threads = 32;
+    quantize_int8_rowwise_static_kernel<<<rows, threads, 0, stream>>>(
+        input, output, d_scales, rows, cols);
+}
+
 __global__ void dequant_int32_to_bf16_kernel(
     const int32_t* __restrict__ input,
     __nv_bfloat16* __restrict__ output,

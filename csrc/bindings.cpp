@@ -966,6 +966,17 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     }, py::arg("input"), py::arg("output"), py::arg("d_scales"),
        py::arg("rows"), py::arg("cols"), py::arg("stream") = 0);
 
+    m.def("quantize_int8_rowwise_static", [](uintptr_t input, uintptr_t output,
+                                              uintptr_t d_scales, int rows, int cols,
+                                              uintptr_t stream) {
+        quantize_int8_rowwise_static(
+            reinterpret_cast<const __nv_bfloat16*>(input),
+            typed_ptr<int8_t>(output),
+            reinterpret_cast<const float*>(d_scales),
+            rows, cols, to_stream(stream));
+    }, py::arg("input"), py::arg("output"), py::arg("d_scales"),
+       py::arg("rows"), py::arg("cols"), py::arg("stream") = 0);
+
     m.def("dequant_int32_to_bf16", [](uintptr_t input, uintptr_t output,
                                        uintptr_t d_act_scale, uintptr_t d_weight_scale,
                                        int n, uintptr_t stream) {

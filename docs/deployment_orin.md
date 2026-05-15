@@ -329,16 +329,56 @@ TC/SM × 1024 ops/cycle × 1.3 GHz), 204 GB/s LPDDR5X.
 
 | Kernel | Time | Lever | Realistic save |
 |---|---:|---|---:|
-| `quantize_int8_rowwise` (dynamic per-row) | 9.2 ms | Switch to **static activation scales** (calibrate-once) like the FP8 path on ThorU | ~7-8 ms |
+| `quantize_int8_rowwise` (dynamic per-row) | 9.2 ms | Switch to **static activation scales** (calibrate-once) like the FP8 path on ThorU | ~~~7-8 ms~~ **measured ~1.4 ms; cosine 0.991→~0.96, fails lossless bar** (kernel landed but opt-in only — see below) |
 | `gate_silu_mul_merged` | 9.6 ms | Replaced by SiLU EVT in commit `48f7f75` — old profile, now ≈0 | (already harvested ~9 ms) |
 | `add_bias_bf16` (vision) | 6.0 ms | Custom CUTLASS BF16 GEMM with bias EVT; or fuse with downstream RMSNorm | ~3-4 ms |
 | `quantize_int8_kernel_generic` | 4.7 ms | Vision static INT8 was disabled — investigate whether this kernel is now dead code | ~4 ms (if dead) |
 | Other small norms / residuals | 7.9 ms | More aggressive fusion / EVT epilogues | ~2 ms |
 
-**Realistic lossless target on SM87**: starting from 127 ms,
-- Conservative (low-risk levers only): −15 to −18 ms → **~109 ms / 9.2 Hz**
-- Aggressive (custom CUTLASS BF16 + GEMM scheduling): −25 to −30 ms →
-  **~97 ms / ~10.3 Hz** *(at the boundary of the 10 Hz lossless target)*
+### Static encoder INT8 — landed and validated, but doesn't pass lossless
+
+The `quantize_int8_rowwise_static` kernel (single-pass, no per-row amax
+reduction) is implemented and wired behind
+`FVK_PI05_RTX_INT8_ENCODER_STATIC=1`. Measured on Orin with
+`pool=1, 2cam, 27L, 10 steps`:
+
+| Mode | p50 | Hz | Cosine vs dynamic |
+|---|---:|---:|---|
+| Dynamic baseline | 125.9 ms | 7.94 | 1.000 (reference) |
+| **Static encoder** (opt-in) | **124.5 ms** | **8.03** | ~0.93-0.98 across 6 frames |
+
+Why the saving is smaller than the roofline: most of the encoder time
+sits in the CUTLASS GEMM (compute-bound), not the quantize step. Even
+saving the entire quantize kernel only nets ~1 ms.
+
+Why cosine drops: per-row scales calibrated on one sample don't
+generalize — vision-token rows whose per-call magnitude exceeds the
+calibration max get clipped. Multi-sample calibration with safety
+inflation would help but isn't implemented yet.
+
+Default is OFF. The kernel + binding are kept as opt-in for callers
+that explicitly accept the trade-off (or as the foundation for a
+future multi-sample calibration pass).
+
+**Realistic lossless target on SM87** (revised after measuring the
+static-encoder lever): starting from 127 ms,
+- Static encoder INT8 (above): −1.4 ms but **fails lossless** → not
+  counted toward target.
+- Conservative (low-risk levers, lossless): dead-code removal
+  (~4 ms) + small-kernel fusion (~2 ms) → **~6-8 ms** → ~119 ms / 8.4 Hz.
+- Aggressive (custom CUTLASS BF16 + bias EVT + GEMM scheduling):
+  another ~10-15 ms → **~104-109 ms / 9.2-9.6 Hz**.
+
+**Honest reassessment**: the conservative roofline-style headroom
+estimates (15-30 ms savings) don't fully materialize when measured.
+The biggest single non-GEMM kernel in the old profile (9.2 ms
+quantize) actually only had ~1 ms of saving available because it
+was already mostly bandwidth-bound. The remaining levers (vision
+bias EVT, GEMM scheduling) are real but each is only a few ms.
+
+**Lossless 10 Hz on Orin alone is harder than the roofline suggests** —
+the path probably requires aggressive custom CUTLASS BF16 GEMMs *plus*
+GEMM scheduling work, both with significant engineering cost.
 
 What this revises about the previous claim: the "no software headroom"
 conclusion was overstated. The 92% utilization applied to one specific

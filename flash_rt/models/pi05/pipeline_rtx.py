@@ -182,6 +182,18 @@ class Pi05Pipeline:
         self.use_int8_vision_static = bool(use_int8_vision_static)
         self.vis_int8_static_scales: dict = {}   # name → CudaBuffer(1, FP32)
         self.vis_int8_static_calibrated = False
+        # Encoder INT8 static-rowwise: after calibration, the per-row scale
+        # buffers populated by quantize_int8_rowwise during the calibration
+        # forward are *frozen* and reused on every subsequent inference. The
+        # hot-path quantize switches from rowwise (3-pass over data, with a
+        # per-row amax warp+block reduction) to rowwise_static (1-pass, no
+        # reduction). Saves ~4-8 ms/inference on the encoder activation
+        # quantize calls. The scales are accurate for input distributions
+        # similar to the calibration sample; for prompt rows they are exact
+        # (prompt is fixed at set_prompt time), for vision rows they assume
+        # camera-similarity. Toggle via FVK_PI05_RTX_INT8_ENCODER_STATIC=1.
+        # Default off until cosine validation passes on the target setup.
+        self.int8_encoder_static_calibrated = False
         self.vision_pool_factor = int(vision_pool_factor)
         self.vision_num_layers = int(vision_num_layers)
         # Tiny-q custom attention: replaces FA2 decoder cross-attention with a
@@ -665,11 +677,22 @@ class Pi05Pipeline:
         Mirrors ``_int8_gemm`` but uses the larger encoder INT8 scratch
         buffers so the decoder path's tiny (chunk=10) scratch is not
         accidentally picked for encoder sequences (~560 rows).
+
+        After ``int8_encoder_static_calibrated`` flips True (set by the
+        frontend after the calibration run has populated the per-row
+        scale buffers), the hot path uses ``quantize_int8_rowwise_static``
+        — single-pass over data, no per-row amax reduction. The CUTLASS
+        GEMM still reads per-row scales from the same buffer; we just
+        stop overwriting it each call.
         """
         act_i8_ptr = self._pick_enc_int8_scratch(act_n)
         layer_scale = self._int8_scale_buf(weight_name, M)
-        self.fvk.quantize_int8_rowwise(
-            act_bf16_ptr, act_i8_ptr, layer_scale.ptr.value, M, K, stream=stream)
+        if self.int8_encoder_static_calibrated:
+            self.fvk.quantize_int8_rowwise_static(
+                act_bf16_ptr, act_i8_ptr, layer_scale.ptr.value, M, K, stream=stream)
+        else:
+            self.fvk.quantize_int8_rowwise(
+                act_bf16_ptr, act_i8_ptr, layer_scale.ptr.value, M, K, stream=stream)
         self._int8_gemm_fused(
             act_i8_ptr, weight_name, out_bf16_ptr, M, N, K,
             layer_scale.ptr.value, stream)

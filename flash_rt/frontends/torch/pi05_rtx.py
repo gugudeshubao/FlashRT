@@ -1159,6 +1159,34 @@ class Pi05TorchFrontendRtx:
                 self.pipeline.vis_int8_static_calibrated = True
                 logger.info("Static INT8 vision calibrated: %d sites",
                             len(self.pipeline.vis_int8_static_scales))
+            # Static encoder INT8 (opt-in via FVK_PI05_RTX_INT8_ENCODER_STATIC=1).
+            # After run_pipeline() above wrote per-row scales via the
+            # dynamic kernel, freeze them and flip the hot path to
+            # quantize_int8_rowwise_static (single-pass, no per-row amax
+            # reduction).
+            #
+            # WARNING — measured on Orin SM87, single-frame calibration:
+            #   * Latency saving: ~1.4 ms p50 (125.9 → 124.5 ms). Smaller
+            #     than the roofline-predicted 4-8 ms because most of the
+            #     encoder time is in the CUTLASS GEMM, not the quantize.
+            #   * Cosine vs dynamic baseline: drops from 0.991 to
+            #     ~0.93-0.98 across a 6-frame test sequence. Failed the
+            #     "lossless" bar — frozen per-row scales calibrated on
+            #     one sample don't generalize: vision-token rows whose
+            #     magnitude exceeds the calibration max get clipped.
+            # Default OFF. Opt-in only when the application explicitly
+            # accepts this trade-off (or after a future multi-sample
+            # calibration with proper safety inflation makes the cosine
+            # drop acceptable).
+            if (self.pipeline.use_int8_encoder
+                    and os.environ.get(
+                        "FVK_PI05_RTX_INT8_ENCODER_STATIC", "0") == "1"):
+                self.pipeline.int8_encoder_static_calibrated = True
+                logger.warning(
+                    "Static INT8 encoder enabled — frozen per-row scales "
+                    "from one calibration sample. Expect cosine drop "
+                    "(~0.96 vs dynamic 0.991 on test sequence). Set "
+                    "FVK_PI05_RTX_INT8_ENCODER_STATIC=0 to disable.")
             self.pipeline.autotune_gemms()
             self.pipeline.record_infer_graph(external_stream_int=stream_int)
 

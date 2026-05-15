@@ -49,6 +49,12 @@ void quantize_int8_rowwise(const __nv_bfloat16* input, int8_t* output,
                            float* d_scales, int rows, int cols,
                            cudaStream_t stream = 0);
 
+// Static per-row INT8 quantize: uses pre-calibrated per-row scales,
+// skips the per-row amax reduction → single-pass over data.
+void quantize_int8_rowwise_static(const __nv_bfloat16* input, int8_t* output,
+                                   const float* d_scales, int rows, int cols,
+                                   cudaStream_t stream = 0);
+
 void dequant_int32_to_bf16(const int32_t* input, __nv_bfloat16* output,
                            const float* d_act_scale, const float* d_weight_scale,
                            int n, cudaStream_t stream = 0);
