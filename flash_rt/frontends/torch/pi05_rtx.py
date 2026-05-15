@@ -1474,12 +1474,37 @@ class Pi05TorchFrontendRtx:
                 "inference requires the decoder-only graph that "
                 "record_infer_graph builds for the cache_frames>1 path")
 
+        # ── Fix path #1: pre-size encoder FA2 scratch to runtime seq. ──
+        # attn._enc_O is allocated at attn_backend init to encoder_seq_max
+        # (= num_views*256 + max_prompt_len). The actual runtime seq is
+        # encoder_seq_len = num_views*256 + actual_prompt_len, typically
+        # smaller. encoder_attn() does `_enc_O[:, :seq].contiguous()` per
+        # layer, and a non-contiguous slice triggers a fresh allocation
+        # from torch's per-stream caching pool. Those allocations can
+        # collide with addresses baked into the captured decoder graph,
+        # which is the root cause of the 0.96-0.99 cosine drift seen in
+        # parallel mode. Re-allocating _enc_O at exactly seq makes the
+        # slice the full tensor (already contiguous) — .contiguous()
+        # returns the same buffer with a stable data_ptr() every call.
+        # We hold the original alive so the existing captured FULL graph
+        # (used by baseline pipe.infer()) keeps working with its baked
+        # addresses if the caller ever mixes the two paths.
+        seq = pipe.encoder_seq_len
+        if attn._enc_O.shape[1] != seq:
+            self._enc_O_orig_ref = attn._enc_O
+            attn._enc_O = torch.empty(
+                1, seq, 8, attn._enc_O.shape[3],
+                dtype=attn._enc_O.dtype, device=attn._enc_O.device)
+            logger.info(
+                "Pipelined: resized attn._enc_O for stable .contiguous() "
+                "(seq=%d, was max=%d)", seq, self._enc_O_orig_ref.shape[1])
+
         self._pipelined_initialized = True
-        # Default to SERIAL mode (correct, ~baseline latency); user can
-        # opt into parallel for experimentation.
+        # Default to SERIAL mode (decoder finishes before encoder); user
+        # can opt into parallel via _pipelined_force_serial = False.
         self._pipelined_force_serial = True
         logger.info("Pipelined dual-stream state initialized "
-                    "(snap K/V = 2x %.1f MB; SERIAL mode default)",
+                    "(snap K/V = 2x %.1f MB)",
                     self._snap_K_pair[0].nbytes / (1024 * 1024))
 
     def infer_pipelined(self, observation: dict) -> dict:

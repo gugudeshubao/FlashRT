@@ -88,49 +88,73 @@ parallel mode.
 | Mode | p50 | Hz | Cosine vs baseline |
 |---|---:|---:|---|
 | Baseline (cache=1, no pipelining) | 127.2 ms | 7.86 | 1.000 |
-| **Pipelined SERIAL** (default) | 130.2 ms | 7.68 | **1.000 ✓** |
-| Pipelined PARALLEL (opt-in)    | 119.4 ms | 8.37 | ~0.97-0.99 ✗ |
+| **Pipelined SERIAL** (default) | 131.1 ms | 7.63 | **1.000 ✓ (maxabs=0)** |
+| Pipelined PARALLEL (opt-in) — after `_enc_O` fix | 120.2 ms | 8.32 | ~0.96-0.99 ✗ |
 | `cache_frames=2` (existing) | 83.3 ms | 12.01 | 0.991 (1-frame K/V stale) |
 
 **Conclusion**: pipelining infrastructure works and SERIAL is
-bit-identical, but **does not yet beat baseline** because (a) PARALLEL has
-a correctness regression, and (b) even if PARALLEL were correct, Orin's
-small 16-SM array doesn't give meaningful GPU-side concurrency between
-encoder and decoder kernels — both sides saturate the array, so streams
-interleave on the SMs rather than running in true parallel. Estimated
-parallel-mode ceiling ≈ 8.5 Hz, still below the 10 Hz target.
+bit-identical (cosine=1.000, maxabs=0), but PARALLEL **caps at 8.32 Hz
+in measurement** — Orin's 16 SMs are saturated by either side alone, so
+streams interleave on the SM array rather than running in true parallel.
+Even *if* the cosine drift in PARALLEL were eliminated, the wall-time
+ceiling sits at ~8.3-8.5 Hz, **still below the 10 Hz target**. Cross-call
+pipelining on Orin alone is therefore not a viable lossless path to 10 Hz.
 
 ## Why PARALLEL drifts
 
 Symptoms: cosine 0.96-0.99 vs baseline (close but not identical),
-errors increase over time. SERIAL mode (force decoder→encoder ordering
-within the call) recovers bit-identity, ruling out the algorithm.
+errors compound over a few frames. SERIAL mode (force decoder→encoder
+ordering within the call) recovers bit-identity, ruling out the
+algorithm and per-frame K/V plumbing.
 
-Suspected root cause: torch's caching allocator partitions per-stream.
-The encoder Python code on `enc_stream` calls `.contiguous()` on
-attention scratch tensors per layer (e.g., `_enc_O[:, :seq].contiguous()`
-when actual `seq < encoder_seq_max`), which allocates from the
-`enc_stream` pool. The captured decoder graph on `dec_stream` has raw
-addresses baked from the original capture-stream pool. When torch
-reassigns the encoder's `.contiguous()` allocations, the addresses
-*can* collide with regions referenced by the decoder graph, corrupting
-the decoder's state.
+**Initially suspected**: torch's per-stream caching allocator
+reassigning `_enc_O[:, :seq].contiguous()` addresses that collide with
+the captured decoder graph's baked addresses (since `_enc_O` was sized
+to `encoder_seq_max=560` but actual `seq=522`, `.contiguous()` did
+allocate fresh memory each layer).
+
+**Tried and verified harmless**: `_init_pipelined_state` now resizes
+`attn._enc_O` to exactly `encoder_seq_len` so `[:, :seq]` is the full
+tensor (already contiguous, no per-call allocation). The fix is
+landed — but PARALLEL cosine drift is *unchanged*. So allocator churn
+was not the root cause.
+
+**Updated hypothesis**: non-deterministic floating-point reductions in
+FA2 split-KV when encoder and decoder kernels interleave on the same
+SM array. FA2 uses online softmax with split-KV accumulator buffers
+(`_enc_lse_accum`, `_enc_o_accum`); the cross-split reduction step uses
+GPU atomics whose ordering depends on SM scheduling. When the encoder
+runs in isolation (SERIAL), the scheduling is reproducible. When the
+encoder and decoder kernels interleave on Orin's 16 SMs (PARALLEL),
+the encoder's reductions land in different orders → tiny K/V
+perturbations → amplified across the decoder's 10 ODE steps to
+cosine 0.96-0.99 visible drift.
+
+This is harder to fix than the allocator theory — it's not a memory
+race, it's a fundamental property of concurrent kernel execution with
+non-deterministic atomics.
 
 ## Fix paths (future work)
 
-1. **Pre-allocate encoder FA2 scratch sized to actual `seq_len`** so
-   `.contiguous()` is a no-op (no per-call allocation, no pool churn).
-   Smallest-touch fix; modify `RtxFlashAttnBackend.__init__` to allocate
-   `_enc_O`, `_enc_lse`, etc. at the runtime seq_len once `set_prompt`
-   has been called.
-2. **Capture the encoder as a CUDA Graph too** — single
-   `cudaGraphLaunch` per call eliminates Python-side allocation
-   entirely. Per-slot encoder graph captures previously hit similar
-   subtle issues; a clean path is to use `torch.cuda.graphs.graph()`
-   (allocator-aware) instead of the ctypes-based `CUDAGraph` wrapper.
-3. **Pin the captured graph's memory pool** — `cudaMallocFromPoolAsync`
+1. ~~**Pre-allocate encoder FA2 scratch**~~ (landed — no measurable
+   improvement; root cause was not allocator churn).
+2. **Disable split-KV in encoder FA2 when in pipelined mode**. With
+   `lse_accum=None, o_accum=None` the FA2 wrapper falls back to a
+   single-block kernel without atomic cross-split reductions →
+   deterministic regardless of co-tenant kernel activity. Cost: may
+   reduce SigLIP throughput slightly when split-KV would otherwise
+   help; needs re-measurement.
+3. **Capture the encoder as a CUDA Graph too** — single
+   `cudaGraphLaunch` per call. The captured kernels have fixed launch
+   ordering and the GPU's command buffer schedules them deterministically
+   relative to other graphs. (Per-slot encoder graphs previously hit
+   subtle capture-time issues; a `torch.cuda.graphs.graph()`
+   allocator-aware path is cleaner than the ctypes-based `CUDAGraph`
+   wrapper.)
+4. **Pin the captured graph's memory pool** — `cudaMallocFromPoolAsync`
    with a dedicated pool for graph-baked tensors that the encoder's
-   pool cannot reach.
+   pool cannot reach. (Defensive; not needed if root cause is FA2
+   atomics, but cheap insurance.)
 
 ## What this branch *does* unblock
 
