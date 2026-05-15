@@ -301,8 +301,54 @@ Orin's encoder GEMM is actually at **higher GPU utilization** (92%) than
 ThorU (74%) for this shape. The speedup on ThorU is purely from higher
 absolute TOPS per SM in FP8, not better kernel efficiency.
 
-The 3× total gap is a **hardware gap** (FP8 TOPS), not a software gap.
-Software optimizations have extracted most available headroom on SM87.
+The 3× total gap is a **hardware gap** (FP8 TOPS), not a software gap
+*for the largest GEMM*. But that 92% number is for **one peak-shape GEMM
+in isolation**; the global picture across the full inference is more
+nuanced.
+
+### Refined headroom analysis (re-done 2026-05)
+
+Earlier this doc concluded "software optimizations have extracted most
+available headroom on SM87" based solely on the 92% ncu number for the
+biggest GEMM shape. A roofline + per-kernel review gives a more
+nuanced picture:
+
+**Hardware peak:** Orin AGX 64GB GPU = ~42 TOPS INT8 dense (16 SMs × 4
+TC/SM × 1024 ops/cycle × 1.3 GHz), 204 GB/s LPDDR5X.
+
+**Encoder GEMM totals (18 layers, INT8):**
+- Theoretical compute lower bound: ~54 ms (sum of `2*M*N*K / peak_TOPS`
+  for all layer GEMMs).
+- Measured: ~65 ms.
+- **Achieved utilization: ~83% globally** — not 92%. The 92% was a
+  single-call ncu number that doesn't reflect the kernel mix.
+- Remaining headroom in encoder GEMMs alone: **~10 ms** if perfectly
+  scheduled.
+
+**Non-GEMM kernels (~50 ms total):** several have known levers:
+
+| Kernel | Time | Lever | Realistic save |
+|---|---:|---|---:|
+| `quantize_int8_rowwise` (dynamic per-row) | 9.2 ms | Switch to **static activation scales** (calibrate-once) like the FP8 path on ThorU | ~7-8 ms |
+| `gate_silu_mul_merged` | 9.6 ms | Replaced by SiLU EVT in commit `48f7f75` — old profile, now ≈0 | (already harvested ~9 ms) |
+| `add_bias_bf16` (vision) | 6.0 ms | Custom CUTLASS BF16 GEMM with bias EVT; or fuse with downstream RMSNorm | ~3-4 ms |
+| `quantize_int8_kernel_generic` | 4.7 ms | Vision static INT8 was disabled — investigate whether this kernel is now dead code | ~4 ms (if dead) |
+| Other small norms / residuals | 7.9 ms | More aggressive fusion / EVT epilogues | ~2 ms |
+
+**Realistic lossless target on SM87**: starting from 127 ms,
+- Conservative (low-risk levers only): −15 to −18 ms → **~109 ms / 9.2 Hz**
+- Aggressive (custom CUTLASS BF16 + GEMM scheduling): −25 to −30 ms →
+  **~97 ms / ~10.3 Hz** *(at the boundary of the 10 Hz lossless target)*
+
+What this revises about the previous claim: the "no software headroom"
+conclusion was overstated. The 92% utilization applied to one specific
+GEMM shape under ncu microbench conditions; the global inference has
+~15-30 ms of measurable software-extractable headroom across non-GEMM
+kernels and GEMM scheduling. **It is not free** — getting all of it
+requires custom CUTLASS BF16 GEMMs with bias EVT for SigLIP, custom
+PTX-level fusion, and a cosine validation for static activation scales.
+But the path to ~10 Hz lossless does exist within software bounds, just
+at a higher engineering cost than initially estimated.
 
 ## Comparison with ThorU
 

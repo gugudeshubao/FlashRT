@@ -100,6 +100,21 @@ Even *if* the cosine drift in PARALLEL were eliminated, the wall-time
 ceiling sits at ~8.3-8.5 Hz, **still below the 10 Hz target**. Cross-call
 pipelining on Orin alone is therefore not a viable lossless path to 10 Hz.
 
+**The actual 10 Hz path is single-frame kernel optimization, not
+pipelining** — see `deployment_orin.md` "Refined headroom analysis"
+for the per-kernel breakdown:
+- ~8 ms from static encoder activation scales (replace dynamic per-row
+  quantize like ThorU's FP8 path does).
+- ~3 ms from fused vision bias (custom CUTLASS BF16 + bias EVT).
+- ~4 ms from removing dead vision INT8 quantize.
+- ~5-10 ms from custom CUTLASS scheduling on the dominant GEMMs.
+
+Combined optimistic: 127 → ~97 ms = ~10.3 Hz losslessly. Engineering
+cost is real (custom CUTLASS kernels + cosine validation per change)
+but the path *exists* within software bounds. This branch's
+infrastructure (snap K/V, dual-stream, captured graph reuse) remains
+useful for the ThorU port where GPU concurrency is genuinely available.
+
 ## Why PARALLEL drifts
 
 Symptoms: cosine 0.96-0.99 vs baseline (close but not identical),
