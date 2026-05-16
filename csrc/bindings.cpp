@@ -140,6 +140,9 @@ extern "C" int cutlass_int8_silu_gated_bf16out(
 extern "C" int cutlass_int8_rowwise_bf16out(
     void const* A, void const* B, void const* act_scale, void const* weight_scale,
     void* D, int M, int N, int K, cudaStream_t stream);
+extern "C" int cutlass_int8_rowwise_bf16out_t64x128(
+    void const* A, void const* B, void const* act_scale, void const* weight_scale,
+    void* D, int M, int N, int K, cudaStream_t stream);
 extern "C" void tq_dequant_kv_fused_launch(
     const void* k_idx_packed, const void* k_qjl_packed,
     const void* k_norm, const void* k_rnorm,
@@ -1075,6 +1078,17 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
           [](uintptr_t A, uintptr_t B, uintptr_t act_scale, uintptr_t weight_scale,
              uintptr_t D, int M, int N, int K, uintptr_t stream) {
               return cutlass_int8_rowwise_bf16out(
+                  to_ptr(A), to_ptr(B), to_ptr(act_scale), to_ptr(weight_scale),
+                  to_ptr(D), M, N, K, to_stream(stream));
+          },
+          py::arg("A"), py::arg("B"), py::arg("act_scale"), py::arg("weight_scale"),
+          py::arg("D"), py::arg("M"), py::arg("N"), py::arg("K"),
+          py::arg("stream") = 0);
+
+    m.def("cutlass_int8_rowwise_bf16out_t64x128",
+          [](uintptr_t A, uintptr_t B, uintptr_t act_scale, uintptr_t weight_scale,
+             uintptr_t D, int M, int N, int K, uintptr_t stream) {
+              return cutlass_int8_rowwise_bf16out_t64x128(
                   to_ptr(A), to_ptr(B), to_ptr(act_scale), to_ptr(weight_scale),
                   to_ptr(D), M, N, K, to_stream(stream));
           },

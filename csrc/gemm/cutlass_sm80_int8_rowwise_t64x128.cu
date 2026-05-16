@@ -1,7 +1,6 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 #include <cstdio>
-#include <cstdlib>
 
 #include "cutlass/cutlass.h"
 #include "cutlass/numeric_types.h"
@@ -15,7 +14,7 @@
 
 namespace flash_rt {
 namespace gemm {
-namespace cutlass_int8_sm8x {
+namespace cutlass_int8_sm8x_t64x128 {
 
 using namespace cute;
 
@@ -34,8 +33,13 @@ constexpr int AlignmentC = 8;
 
 using ArchTag = cutlass::arch::Sm80;
 using OperatorClass = cutlass::arch::OpClassTensorOp;
-using ThreadblockShape = cutlass::gemm::GemmShape<128, 128, 64>;
-using WarpShape = cutlass::gemm::GemmShape<64, 64, 64>;
+// Alt tile: smaller M (64) for shapes where M ≈ 522 wastes padding in
+// the default 128-M tile. ceil(522/128)=5 M-tiles vs ceil(522/64)=9
+// M-tiles → ~80% more parallelism in the M dim with the same total
+// work. Specifically targets enc_qkv (M=522, N=2560, K=2048) which
+// sits at ~23% util on the 128×128 tile per the per-shape microbench.
+using ThreadblockShape = cutlass::gemm::GemmShape<64, 128, 64>;
+using WarpShape = cutlass::gemm::GemmShape<32, 64, 64>;
 using InstructionShape = cutlass::gemm::GemmShape<16, 8, 32>;
 constexpr int NumStages = 4;
 constexpr int EVTEpilogueStages = 1;
@@ -166,53 +170,7 @@ static int run(
 }  // namespace gemm
 }  // namespace flash_rt
 
-// Forward declaration for the alt-tile variant (defined in
-// cutlass_sm80_int8_rowwise_t64x128.cu). ABI: identical signature.
 extern "C" int cutlass_int8_rowwise_bf16out_t64x128(
-    void const* A, void const* B,
-    void const* act_scale, void const* weight_scale,
-    void* D, int M, int N, int K, cudaStream_t stream);
-
-// Per-Pi0.5-shape tile selection on Orin SM87. Measured (per-shape
-// microbench on this branch, 200 iters each):
-//
-//   shape                       128×128   64×128    winner
-//   enc_qkv  (522,2560,2048)    328 us    214 us    64×128  ⭐ 1.54×
-//   enc_o    (522,2048,2048)     95 us    113 us    128×128
-//   enc_gate (522,8192,2048)    337 us    398 us    128×128
-//   enc_up   (522,8192,2048)    331 us    399 us    128×128
-//   enc_down (522,2048,16384)  1126 us   1419 us    128×128
-//   dec_*    (M=10, N≤8192)     ~50 us    ~46 us   64×128 ⭐ 1.08-1.12×
-//
-// Rule of thumb that captures every winning case here:
-//   * M ≤ 64 (decoder small-M):         64×128 wins (always)
-//   * M > 64 AND N in (2048, 4096]:     64×128 wins (qkv-shape — odd N
-//     above the 2048 wave boundary causes a costly partial wave on 128
-//     tile; the 64-M tile redistributes the slack)
-//   * else (big-N or M-aligned):        128×128 wins (default)
-static inline bool prefer_t64x128_for_shape(int M, int N) {
-    if (M <= 64) return true;                        // decoder
-    if (N > 2048 && N <= 4096) return true;          // qkv-like awkward N
-    return false;
-}
-
-// Tile dispatch is BIT-EQUIVALENT to the default-128×128 baseline:
-// CUTLASS INT8 GEMM accumulates in INT32 (associative integer math, no
-// overflow for our shapes K ≤ 16384 × 127² ≈ 33M ≪ 2³¹), and the EVT
-// fp32-dequant epilogue uses the same multiply order regardless of
-// threadblock tile size. Verified empirically: 6/6 frames maxabs=0.
-//
-// To opt OUT (e.g. for debugging tile-shape regressions), set
-// FVK_PI05_RTX_INT8_NO_TILE_DISPATCH=1.
-static bool tile_dispatch_enabled() {
-    static const int v = []() {
-        const char* env = std::getenv("FVK_PI05_RTX_INT8_NO_TILE_DISPATCH");
-        return (env && env[0] == '1') ? 0 : 1;
-    }();
-    return v != 0;
-}
-
-extern "C" int cutlass_int8_rowwise_bf16out(
     void const* A,
     void const* B,
     void const* act_scale,
@@ -222,10 +180,6 @@ extern "C" int cutlass_int8_rowwise_bf16out(
     int N,
     int K,
     cudaStream_t stream) {
-    if (tile_dispatch_enabled() && prefer_t64x128_for_shape(M, N)) {
-        return cutlass_int8_rowwise_bf16out_t64x128(
-            A, B, act_scale, weight_scale, D, M, N, K, stream);
-    }
-    return flash_rt::gemm::cutlass_int8_sm8x::run(
+    return flash_rt::gemm::cutlass_int8_sm8x_t64x128::run(
         A, B, act_scale, weight_scale, D, M, N, K, stream);
 }
