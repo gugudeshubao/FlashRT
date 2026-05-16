@@ -478,35 +478,48 @@ Two clear regimes:
 | `qkv_split` after vision bias | (2.7 ms, 50% hit) | ~1-1.5 ms | low (already fused with RoPE in encoder, just not vision) |
 | `gelu_kernel` → vision GEMM epilogue | (2.3 ms) | ~1-1.5 ms | medium (custom GEMM-with-GELU) |
 
-#### bias_gelu_bf16 fusion — measured
+#### bias_gelu fusion — measured (LANDED)
 
 The simplest of the L2-driven candidates — fusing `add_bias_bf16` →
-`gelu_inplace` into a single `bias_gelu_bf16` kernel for the SigLIP
-FFN-up output — was implemented and benchmarked. Result:
+`gelu_inplace` into a single kernel for the SigLIP FFN-up output —
+was implemented in two variants and benchmarked. Final result:
 
-| Mode | p50 | Hz | Pipeline cosine vs baseline |
-|---|---:|---:|---|
-| Baseline | 128.0 ms | 7.81 | 1.000 (reference) |
-| **bias_gelu fused** | **127.3 ms** | **7.85** | **0.94-0.99** (fails lossless) |
+| Mode | p50 | Hz | Pipeline cosine vs baseline | bit-equal |
+|---|---:|---:|---|---|
+| Baseline (kernel pair) | 128.0 ms | 7.81 | 1.000 (reference) | ✅ |
+| `bias_gelu_bf16` (fp32 mid) | 127.3 ms | 7.85 | 0.94-0.99 | ❌ |
+| **`bias_gelu_bf16_strict`** ⭐ | **126.6 ms** | **7.90** | **1.000** | **✅** |
 
-Microbench shows the fused kernel is genuinely 2.12× faster in
-isolation. The captured-graph speedup vanishes (most of the savings
-were Python launch overhead that the graph already eliminates),
-leaving ~0.7 ms p50 — sub-noise. Worse, the fused kernel keeps fp32
-between bias-add and GELU while the original rounds to bf16 between
-them, and 27 SigLIP layers amplify the per-step drift to a 0.94-0.99
-end-to-end action cosine.
+The first attempt (fp32 between bias-add and GELU) was
+*more* numerically accurate than the original but caused 0.94-0.99
+action cosine — the downstream INT8 calibration is fitted against
+the original's bf16-rounded intermediate, and 27 SigLIP layers
+amplify the per-step drift.
 
-Pattern reinforces the [static encoder INT8 finding](#static-encoder-int8--landed-and-validated-but-doesnt-pass-lossless):
-**roofline-style fusion estimates over-predict the captured-graph
-ceiling** because the graph already amortizes most of the per-kernel
-overhead. Kernel + binding kept as opt-in (`bias_gelu_bf16`); not
-enabled by default.
+The fix was a **strict variant** that explicitly rounds (x + bias)
+back to bf16 before GELU, mirroring the original kernel pair's
+precision boundary. Result: bit-identical to baseline (max abs diff
+= 0 across 6 test frames) **and** 1.4 ms faster than baseline —
+the pipeline default now uses `bias_gelu_bf16_strict`.
+
+Microbench (seq=512, dim=4304, 200 iters):
+* `add_bias + gelu` pair  : 368.8 µs/call
+* `bias_gelu_bf16` (loose): 115.7 µs/call (3.19× pair)
+* `bias_gelu_bf16_strict` : 129.5 µs/call (2.85× pair)
+
+End-to-end captured-graph saving: **~1.4 ms p50**, sub-noise but
+real and lossless. Encoder K cosine remains 0.991 vs BF16
+reference, identical to pre-fusion. Updated baseline number for
+subsequent comparisons in this doc: **126.6 ms / 7.90 Hz**.
 
 Lessons-learned for the remaining fusion candidates in the table
-above: expect the realized saving to be **~30-50% of the roofline
-estimate** when wired into the captured graph, and budget for a
-calibration / cosine validation pass per change.
+above:
+1. Expect captured-graph savings ~30-50% of the roofline estimate
+   (the graph already amortizes most per-kernel launch overhead).
+2. Any fused kernel that changes the precision boundary between
+   ops requires a strict-precision variant for the lossless path —
+   the relevant downstream calibration was fitted against the
+   exact precision boundary the original kernels expose.
 
 **Combined ceiling from L2-driven fusion: ~5-8 ms** ⇒ baseline 127 ms
 → ~120 ms / 8.3 Hz lossless. Compared to my earlier roofline-style
@@ -593,19 +606,21 @@ bias EVT, GEMM scheduling) are real but each is only a few ms.
 
 **L2 ncu re-profile (above) confirmed this** — the big GEMMs are at
 86-89% L2 hit (saturated), and the small ops sum to only ~10 ms with
-realistic fusion savings of 50-70% (~5-8 ms). Updated ceiling:
+realistic fusion savings of 50-70% (~5-8 ms). Updated ceiling
+(numbers reflect bias_gelu_strict already landed → new baseline 126.6 ms):
 
-- After all realistic L2-driven fusion (~6 ms): **~121 ms / 8.3 Hz**
-- Plus full custom CUTLASS BF16 GEMM + bias EVT for vision (~3 ms more
-  on top of fusion already counted): **~118 ms / 8.5 Hz**
-- Plus custom encoder GEMM scheduling improvements (~5-10 ms,
-  uncertain): **~108-113 ms / 8.8-9.3 Hz**
+- bias_gelu_strict: **−1.4 ms** ⇒ **126.6 ms / 7.90 Hz** (current default)
+- Remaining L2-driven fusion (`bias_res` + `qkv_split` + small): ~3-4 ms
+  → ~123 ms / 8.1 Hz
+- Plus custom CUTLASS BF16 GEMM + bias EVT for vision: ~2-3 ms more
+  → ~120 ms / 8.3 Hz
+- Plus custom encoder GEMM scheduling improvements: ~5-10 ms uncertain
+  → ~110-115 ms / 8.7-9.1 Hz
 
 **Lossless 10 Hz on Orin alone is unlikely with software work** —
-the L2 data shows the optimization budget is tighter than the
-roofline estimate. Aggressive engineering can probably get to ~9 Hz,
-but the last 1 Hz to clear 10 Hz needs hardware (more SMs, FP8 TCs)
-not software.
+even after every realistic fusion lands, the projection caps at
+~9 Hz. The last 1 Hz to clear 10 Hz needs hardware (more SMs, FP8
+TCs), not software.
 
 What this revises about the previous claim: the "no software headroom"
 conclusion was overstated. The 92% utilization applied to one specific

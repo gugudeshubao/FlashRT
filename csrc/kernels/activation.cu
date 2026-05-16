@@ -112,6 +112,58 @@ void bias_gelu_fp16(__half* x, const __half* bias,
     bias_gelu_kernel<__half><<<seq_len, 256, 0, stream>>>(x, bias, dim);
 }
 
+// ── Strict-precision variant (bit-equivalent to add_bias_bf16 + gelu_inplace) ──
+//
+// The non-strict bias_gelu_kernel above keeps fp32 between bias-add and
+// GELU; that's *more* numerically accurate, but downstream INT8
+// calibration is fitted against the original kernel pair's bf16
+// round-trip — feeding the calibrator slightly-different activations
+// drifts every layer's quant scale and accumulates over 27 SigLIP
+// layers to ~0.94-0.99 action cosine.
+//
+// This strict variant explicitly rounds (x + bias) back to bf16 before
+// GELU, exactly mirroring add_bias_bf16's bf16 store + gelu_inplace's
+// bf16 load. Result is bit-identical to the kernel-pair sequence; the
+// only saving is one fewer DRAM round-trip on the (seq × dim) buffer.
+template<typename T>
+__global__ void bias_gelu_strict_kernel(
+        T* __restrict__ x,
+        const T* __restrict__ bias,
+        int dim) {
+    using T2 = typename packed2<T>::type;
+    int row = blockIdx.x;
+    T2* x2 = reinterpret_cast<T2*>(x + (size_t)row * dim);
+    const T2* b2 = reinterpret_cast<const T2*>(bias);
+    int dim2 = dim >> 1;
+    for (int i = threadIdx.x; i < dim2; i += blockDim.x) {
+        T2 xv = x2[i], bv = b2[i];
+        // Step 1: bias add, round to bf16 (matches add_bias_bf16's
+        // bf16 store after the fp32 sum).
+        T mid_x = from_f32<T>(to_f32(xv.x) + to_f32(bv.x));
+        T mid_y = from_f32<T>(to_f32(xv.y) + to_f32(bv.y));
+        // Step 2: read back as fp32 for GELU (matches gelu_inplace's
+        // bf16 load → fp32 promotion).
+        float v0 = to_f32(mid_x), v1 = to_f32(mid_y);
+        float t0 = tanhf(0.7978845608f * (v0 + 0.044715f * v0 * v0 * v0));
+        float t1 = tanhf(0.7978845608f * (v1 + 0.044715f * v1 * v1 * v1));
+        x2[i] = make_packed2<T>(
+            from_f32<T>(v0 * 0.5f * (1.0f + t0)),
+            from_f32<T>(v1 * 0.5f * (1.0f + t1)));
+    }
+}
+
+FVK_KERNEL_INSTANTIATE(__global__ void bias_gelu_strict_kernel<__half>(__half*, const __half*, int))
+FVK_KERNEL_INSTANTIATE(__global__ void bias_gelu_strict_kernel<__nv_bfloat16>(__nv_bfloat16*, const __nv_bfloat16*, int))
+
+void bias_gelu_bf16_strict(__nv_bfloat16* x, const __nv_bfloat16* bias,
+                            int seq_len, int dim, cudaStream_t stream) {
+    bias_gelu_strict_kernel<__nv_bfloat16><<<seq_len, 256, 0, stream>>>(x, bias, dim);
+}
+void bias_gelu_fp16_strict(__half* x, const __half* bias,
+                            int seq_len, int dim, cudaStream_t stream) {
+    bias_gelu_strict_kernel<__half><<<seq_len, 256, 0, stream>>>(x, bias, dim);
+}
+
 // ── Gate GELU Mul Merged ──
 // Input: (seq, 2*half_dim), gate = [:, :half_dim], up = [:, half_dim:]
 template<typename T>
