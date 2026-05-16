@@ -521,6 +521,33 @@ above:
    the relevant downstream calibration was fitted against the
    exact precision boundary the original kernels expose.
 
+#### bias_residual + LayerNorm fusion — measured (LANDED, sub-noise)
+
+Second L2-driven fusion: combined `bias_residual` + `layer_norm`
+(the pair between attention output and pre-FFN normalization in each
+SigLIP layer) into a single `bias_residual_layer_norm_bf16` kernel.
+Strict 3-pass implementation that re-reads residual from global on
+passes 2 and 3 (matching the original kernel pair's behavior
+bit-for-bit; an earlier smem-cached variant produced 1-ULP drift on
+the SigLIP shape that compounded to 0.91-0.98 action cosine).
+
+Microbench (200 iters):
+* SigLIP shape (512, 1152): pair 133.8 µs, fused 88.6 µs (1.51× faster)
+* Encoder shape (522, 2048): pair 219.0 µs, fused 90.7 µs (2.42× faster)
+
+Pipeline (27 SigLIP layers, replaces 27/54 of the layer-boundary pairs):
+* Action cosine vs baseline: **bit-equal across 6/6 frames** ✅
+* p50 latency: 126.7 ms / 7.89 Hz vs 126.6 ms with bias_gelu_strict
+  alone — **+0.1 ms, sub-noise**
+
+Why so much smaller than microbench predicts: the captured CUDA
+graph has near-zero per-kernel-launch overhead, so fusing 2 kernels
+into 1 only saves a fraction of the per-kernel time, not the full
+1.5-2× microbench delta. The remaining 27 layer-boundary pairs
+(post-FFN-down → next-layer's pre-attn-LN) cross Python iteration
+boundaries and would require a more involved refactor to fuse —
+not worth pursuing given the negligible gain pattern observed here.
+
 **Combined ceiling from L2-driven fusion: ~5-8 ms** ⇒ baseline 127 ms
 → ~120 ms / 8.3 Hz lossless. Compared to my earlier roofline-style
 "15-25 ms" estimate this is materially smaller. The L2 data confirms

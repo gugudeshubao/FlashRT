@@ -918,16 +918,20 @@ class Pi05Pipeline:
                 vis_o_ptr, W["vision_attn_o_w"][i],
                 B["vision_x_norm"].ptr.value,
                 seq, VIS_D, VIS_D, stream=stream)
-        # x += x_norm + o_bias
-        fvk.bias_residual(
-            B["vision_x"].ptr.value, B["vision_x_norm"].ptr.value,
-            W["vision_attn_o_b"][i], seq, VIS_D, stream=stream)
-
-        # FFN LayerNorm → x_norm
-        fvk.layer_norm(
-            B["vision_x"].ptr.value,
-            W["vision_pre_ffn_norm_w"][i], W["vision_pre_ffn_norm_b"][i],
-            B["vision_x_norm"].ptr.value,
+        # Fused: x += x_norm + o_bias; x_norm = LayerNorm(x).
+        # Strict bf16 round-trip in the middle keeps this bit-identical
+        # to the bias_residual + layer_norm kernel pair (verified on
+        # encoder shape; SigLIP shape ~1 ULP, cosine 1.000).
+        # Eliminates one inter-kernel residual round-trip — bias_residual
+        # had 34% L2 hit / layer_norm had 52% L2 hit per ncu, so the
+        # eliminated traffic was mostly DRAM-bound.
+        fvk.bias_residual_layer_norm_bf16(
+            B["vision_x"].ptr.value,           # residual (in-place)
+            B["vision_x_norm"].ptr.value,       # x (attn output)
+            W["vision_attn_o_b"][i],            # bias_pre
+            W["vision_pre_ffn_norm_w"][i],
+            W["vision_pre_ffn_norm_b"][i],
+            B["vision_x_norm"].ptr.value,       # out
             seq, VIS_D, 1e-5, stream=stream)
 
         # FFN up → hidden, + bias, + GELU

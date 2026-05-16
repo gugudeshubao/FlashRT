@@ -1099,6 +1099,114 @@ void residual_add_rms_norm_int8_rowwise(
         residual, x, weight, out, scales, seq_len, dim, eps);
 }
 
+// ── Fused bias-residual + LayerNorm (strict bf16 round-trip in middle) ──
+//
+// Fuses three SigLIP ops that appear between consecutive sub-blocks:
+//   residual += x + bias_pre        (bias_residual kernel, ncu L2 hit ~34%)
+//   out      = LayerNorm(residual)  (layer_norm kernel,    ncu L2 hit ~52%)
+// into a single block-per-row kernel. The intermediate `residual` write
+// + read between the two original kernels is the worst-L2-hit (DRAM-
+// bound) traffic in the SigLIP path; fusing eliminates that round-trip
+// entirely.
+//
+// **Strict-precision contract** (matches the bias_residual + layer_norm
+// pair bit-for-bit):
+//   1. bias-add result is rounded to bf16 BEFORE the LN computation
+//      (mirrors bias_residual storing bf16 to global, layer_norm
+//      promoting bf16 → fp32 on read).
+//   2. The LN sum/var reductions, normalization, weight/bias apply,
+//      and final bf16 round are bit-identical to the existing
+//      layer_norm_kernel.
+//
+// SMEM layout (for blockDim.x = 256):
+//   smem[0..31] = block_reduce_sum partials (one per warp, max 8 for
+//                 blockDim.x = 256). 1024 bytes total — same as
+//                 layer_norm_kernel.
+template<typename T>
+__global__ void bias_residual_layer_norm_kernel(
+        T* __restrict__ residual,
+        const T* __restrict__ x,
+        const T* __restrict__ bias_pre,
+        const T* __restrict__ ln_weight,
+        const T* __restrict__ ln_bias,
+        T* __restrict__ out,
+        int dim, float eps) {
+    extern __shared__ float partial[];
+
+    int row = blockIdx.x;
+    using T2 = typename packed2<T>::type;
+    T2* res2 = reinterpret_cast<T2*>(residual + (size_t)row * dim);
+    const T2* x2 = reinterpret_cast<const T2*>(x + (size_t)row * dim);
+    const T2* b2 = reinterpret_cast<const T2*>(bias_pre);
+    const T2* w2 = reinterpret_cast<const T2*>(ln_weight);
+    const T2* lnb2 = reinterpret_cast<const T2*>(ln_bias);
+    T2* out2 = reinterpret_cast<T2*>(out + (size_t)row * dim);
+    int dim2 = dim >> 1;
+
+    // Pass 1: residual = bf16(residual + x + bias_pre) (write to global),
+    // accumulate sum for mean. We re-read residual from global on passes
+    // 2 and 3 — strictly matching layer_norm_kernel's behavior. (An
+    // earlier smem-cached variant produced 1-ULP drift on the SigLIP
+    // shape; subtle precision difference between 'fp32 stored to smem'
+    // and 'bf16 stored to global, re-read'. Re-reading from global is
+    // bit-equivalent to running the kernel pair sequentially.)
+    float local_sum = 0.0f;
+    for (int i = threadIdx.x; i < dim2; i += blockDim.x) {
+        T2 rv = res2[i], xv = x2[i], bv = b2[i];
+        T r0 = from_f32<T>(to_f32(rv.x) + to_f32(xv.x) + to_f32(bv.x));
+        T r1 = from_f32<T>(to_f32(rv.y) + to_f32(xv.y) + to_f32(bv.y));
+        res2[i] = make_packed2<T>(r0, r1);
+        local_sum += to_f32(r0) + to_f32(r1);
+    }
+    float mean = block_reduce_sum(local_sum, partial) / dim;
+
+    // Pass 2: re-read residual from global (now bf16), compute
+    // (val - mean)^2, accumulate var. Bit-identical to layer_norm_kernel.
+    float local_var = 0.0f;
+    for (int i = threadIdx.x; i < dim2; i += blockDim.x) {
+        T2 val = res2[i];
+        float d0 = to_f32(val.x) - mean, d1 = to_f32(val.y) - mean;
+        local_var += d0 * d0 + d1 * d1;
+    }
+    float inv_std = rsqrtf(block_reduce_sum(local_var, partial) / dim + eps);
+
+    // Pass 3: re-read residual, normalize, apply weight/bias, write out.
+    // Identical to layer_norm_kernel's final loop.
+    for (int i = threadIdx.x; i < dim2; i += blockDim.x) {
+        T2 val = res2[i];
+        T2 wv = w2[i], lbv = lnb2[i];
+        float v0 = to_f32(val.x), v1 = to_f32(val.y);
+        float n0 = (v0 - mean) * inv_std * to_f32(wv.x) + to_f32(lbv.x);
+        float n1 = (v1 - mean) * inv_std * to_f32(wv.y) + to_f32(lbv.y);
+        out2[i] = make_packed2<T>(from_f32<T>(n0), from_f32<T>(n1));
+    }
+}
+
+FVK_KERNEL_INSTANTIATE(__global__ void bias_residual_layer_norm_kernel<__half>(__half*, const __half*, const __half*, const __half*, const __half*, __half*, int, float))
+FVK_KERNEL_INSTANTIATE(__global__ void bias_residual_layer_norm_kernel<__nv_bfloat16>(__nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*, __nv_bfloat16*, int, float))
+
+void bias_residual_layer_norm_bf16(
+        __nv_bfloat16* residual, const __nv_bfloat16* x,
+        const __nv_bfloat16* bias_pre,
+        const __nv_bfloat16* ln_weight, const __nv_bfloat16* ln_bias,
+        __nv_bfloat16* out, int seq_len, int dim, float eps,
+        cudaStream_t stream) {
+    int smem = 256 * sizeof(float);
+    bias_residual_layer_norm_kernel<__nv_bfloat16><<<seq_len, 256, smem, stream>>>(
+        residual, x, bias_pre, ln_weight, ln_bias, out, dim, eps);
+}
+
+void bias_residual_layer_norm_fp16(
+        __half* residual, const __half* x,
+        const __half* bias_pre,
+        const __half* ln_weight, const __half* ln_bias,
+        __half* out, int seq_len, int dim, float eps,
+        cudaStream_t stream) {
+    int smem = 256 * sizeof(float);
+    bias_residual_layer_norm_kernel<__half><<<seq_len, 256, smem, stream>>>(
+        residual, x, bias_pre, ln_weight, ln_bias, out, dim, eps);
+}
+
 // ── Vision Token Spatial Average Pooling (BF16) ──
 //
 // Reduces SigLIP output from (nv * spv, dim) to (nv * spv / (f*f), dim)

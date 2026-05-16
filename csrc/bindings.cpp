@@ -461,6 +461,24 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
        py::arg("seq_len"), py::arg("dim"), py::arg("eps") = 1e-6f,
        py::arg("stream") = 0);
 
+    m.def("bias_residual_layer_norm_bf16", [](uintptr_t residual, uintptr_t x,
+                                                uintptr_t bias_pre,
+                                                uintptr_t ln_weight, uintptr_t ln_bias,
+                                                uintptr_t out,
+                                                int seq_len, int dim, float eps,
+                                                uintptr_t stream) {
+        bias_residual_layer_norm_bf16(
+            typed_ptr<__nv_bfloat16>(residual), typed_ptr<__nv_bfloat16>(x),
+            reinterpret_cast<const __nv_bfloat16*>(bias_pre),
+            reinterpret_cast<const __nv_bfloat16*>(ln_weight),
+            reinterpret_cast<const __nv_bfloat16*>(ln_bias),
+            typed_ptr<__nv_bfloat16>(out), seq_len, dim, eps,
+            to_stream(stream));
+    }, py::arg("residual"), py::arg("x"), py::arg("bias_pre"),
+       py::arg("ln_weight"), py::arg("ln_bias"), py::arg("out"),
+       py::arg("seq_len"), py::arg("dim"), py::arg("eps") = 1e-5f,
+       py::arg("stream") = 0);
+
     // Fused Norm → FP8
     m.def("rms_norm_fp8", [](uintptr_t x, uintptr_t weight, uintptr_t out,
                               int seq_len, int dim, float eps,

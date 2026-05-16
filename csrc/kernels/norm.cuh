@@ -147,6 +147,30 @@ void residual_add_rms_norm_int8_rowwise(
         int seq_len, int dim, float eps,
         cudaStream_t stream = 0);
 
+// ── Fused bias-residual + LayerNorm (SigLIP between-block hot-path) ──
+//
+// Strict-precision fusion of bias_residual + layer_norm:
+//   residual = bf16(residual + x + bias_pre)    (bf16 round-trip middle)
+//   out      = LayerNorm(residual, ln_w, ln_b)
+//
+// Bit-identical to running bias_residual + layer_norm sequentially
+// (same precision boundary). Eliminates the inter-kernel residual
+// round-trip through DRAM — bias_residual has 34% L2 hit / layer_norm
+// has 52% L2 hit on Orin SM87, so this round-trip is mostly DRAM-bound.
+void bias_residual_layer_norm_bf16(
+        __nv_bfloat16* residual, const __nv_bfloat16* x,
+        const __nv_bfloat16* bias_pre,
+        const __nv_bfloat16* ln_weight, const __nv_bfloat16* ln_bias,
+        __nv_bfloat16* out, int seq_len, int dim, float eps,
+        cudaStream_t stream = 0);
+
+void bias_residual_layer_norm_fp16(
+        __half* residual, const __half* x,
+        const __half* bias_pre,
+        const __half* ln_weight, const __half* ln_bias,
+        __half* out, int seq_len, int dim, float eps,
+        cudaStream_t stream = 0);
+
 // ── Production-exact kernels (no weight, no scale) ──
 
 // RMSNorm → FP8 (no weight, no d_scale). Matches pi05 fused_rms_fp8.
