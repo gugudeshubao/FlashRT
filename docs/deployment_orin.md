@@ -535,18 +535,20 @@ Microbench (200 iters):
 * SigLIP shape (512, 1152): pair 133.8 µs, fused 88.6 µs (1.51× faster)
 * Encoder shape (522, 2048): pair 219.0 µs, fused 90.7 µs (2.42× faster)
 
-Pipeline (27 SigLIP layers, replaces 27/54 of the layer-boundary pairs):
+Pipeline (replaces both layer-boundary pairs after a small refactor:
+post-attn → pre-FFN-norm AND post-FFN-down → next-layer's
+pre-attn-norm; layer-0's pre-attn-norm hoisted before the loop;
+last layer skips the LN tail since vision_x consumes nothing
+LN-shaped after it):
 * Action cosine vs baseline: **bit-equal across 6/6 frames** ✅
-* p50 latency: 126.7 ms / 7.89 Hz vs 126.6 ms with bias_gelu_strict
-  alone — **+0.1 ms, sub-noise**
+* p50 latency: **126.4 ms / 7.92 Hz** vs 128.0 ms baseline (3-run
+  median, 50 iters each) — **-1.6 ms / +0.11 Hz cumulative across
+  bias_gelu_strict + both brln pairs**.
 
 Why so much smaller than microbench predicts: the captured CUDA
 graph has near-zero per-kernel-launch overhead, so fusing 2 kernels
 into 1 only saves a fraction of the per-kernel time, not the full
-1.5-2× microbench delta. The remaining 27 layer-boundary pairs
-(post-FFN-down → next-layer's pre-attn-LN) cross Python iteration
-boundaries and would require a more involved refactor to fuse —
-not worth pursuing given the negligible gain pattern observed here.
+1.5-2× microbench delta.
 
 **Combined ceiling from L2-driven fusion: ~5-8 ms** ⇒ baseline 127 ms
 → ~120 ms / 8.3 Hz lossless. Compared to my earlier roofline-style

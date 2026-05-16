@@ -823,8 +823,18 @@ class Pi05Pipeline:
         # Reducing layers is a quality/speed trade-off (untrained skip).
         use_fp8 = self.use_fp8 and "vision_attn_qkv_w_0" in self.weights.get("fp8", {})
 
+        # Layer-0 pre-attn LayerNorm runs here (the rest are fused into
+        # the prior layer's post-FFN bias_residual, so each iteration
+        # arrives with vision_x_norm already containing LN of vision_x).
+        fvk.layer_norm(
+            B["vision_x"].ptr.value,
+            W["vision_pre_attn_norm_w"][0], W["vision_pre_attn_norm_b"][0],
+            B["vision_x_norm"].ptr.value,
+            seq, VIS_D, 1e-5, stream=stream)
+
+        last = self.vision_num_layers - 1
         for i in range(self.vision_num_layers):
-            self._vision_layer(i, seq, use_fp8, stream)
+            self._vision_layer(i, seq, use_fp8, stream, is_last=(i == last))
 
         # A7 (optional): Spatial average pooling — reduce (nv*256, D) to (nv*64, D)
         # Runs only when vision_pool_factor > 1. vision_x_pooled is a separate
@@ -837,8 +847,17 @@ class Pi05Pipeline:
                 B["vision_x_pooled"].ptr.value,
                 nv, H, H, VIS_D, self.vision_pool_factor, stream)
 
-    def _vision_layer(self, i: int, seq: int, use_fp8: bool, stream: int) -> None:
-        """One SigLIP transformer layer (pre-norm, LayerNorm, GELU FFN)."""
+    def _vision_layer(self, i: int, seq: int, use_fp8: bool, stream: int,
+                       is_last: bool = False) -> None:
+        """One SigLIP transformer layer (pre-norm, LayerNorm, GELU FFN).
+
+        Pre-attn LayerNorm is hoisted: layer 0's runs in
+        :meth:`vision_encoder` before the loop; layers 1..N-1's runs
+        as the LN tail of the previous layer's fused
+        bias_residual_layer_norm at the post-FFN-down position.
+        Each iteration enters with ``vision_x_norm`` already holding
+        ``LayerNorm(vision_x)`` for *this* layer's pre-attn site.
+        """
         fvk = self.fvk
         gemm = self.gemm
         W = self.weights
@@ -846,13 +865,6 @@ class Pi05Pipeline:
         attn_ptrs = self._attn_ptrs
         use_int8_vis = self.use_int8_vision
         use_int8_vis_static = self.use_int8_vision_static
-
-        # Attention LayerNorm → x_norm
-        fvk.layer_norm(
-            B["vision_x"].ptr.value,
-            W["vision_pre_attn_norm_w"][i], W["vision_pre_attn_norm_b"][i],
-            B["vision_x_norm"].ptr.value,
-            seq, VIS_D, 1e-5, stream=stream)
 
         # QKV GEMM (static INT8 / dynamic INT8 / FP8 / BF16) → vision_QKV
         if use_int8_vis_static:
@@ -994,9 +1006,26 @@ class Pi05Pipeline:
                 B["vision_hidden"].ptr.value, W["vision_ffn_down_w"][i],
                 B["vision_x_norm"].ptr.value,
                 seq, VIS_D, VIS_H, stream=stream)
-        fvk.bias_residual(
-            B["vision_x"].ptr.value, B["vision_x_norm"].ptr.value,
-            W["vision_ffn_down_b"][i], seq, VIS_D, stream=stream)
+        if is_last:
+            # Last layer: just bias_residual; vision_x is the final residual,
+            # consumed by avg_pool_vision_tokens / multi-modal projector.
+            # No follow-up LN to fuse.
+            fvk.bias_residual(
+                B["vision_x"].ptr.value, B["vision_x_norm"].ptr.value,
+                W["vision_ffn_down_b"][i], seq, VIS_D, stream=stream)
+        else:
+            # Layers 0..N-2: fuse the post-FFN bias_residual with the NEXT
+            # layer's pre-attn LayerNorm. After this kernel, vision_x_norm
+            # holds LN of (vision_x post-residual) ready for layer i+1's
+            # attn QKV. Same kernel as the post-attn → pre-FFN fusion above.
+            fvk.bias_residual_layer_norm_bf16(
+                B["vision_x"].ptr.value,                  # residual (in-place)
+                B["vision_x_norm"].ptr.value,              # x (FFN-down output)
+                W["vision_ffn_down_b"][i],                 # bias_pre
+                W["vision_pre_attn_norm_w"][i + 1],
+                W["vision_pre_attn_norm_b"][i + 1],
+                B["vision_x_norm"].ptr.value,              # out (next layer's LN input)
+                seq, VIS_D, 1e-5, stream=stream)
 
     # ══════════════════════════════════════════════════════════════════
     #   Phase B: Gemma-2B encoder
