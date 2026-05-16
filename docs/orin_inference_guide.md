@@ -281,6 +281,14 @@ degrades encoder cosine from 0.991 → 0.282 and is disabled).
 > **Note**: `FVK_PI05_RTX_INT8_ENCODER_ONLY` is confirmed slower (+15ms)
 > because INT8 has 2× higher TOPS than BF16 even at M=10 decoder matrices.
 
+### Orin does not use W4A8
+
+**W4A8** in FlashRT is a **Blackwell (SM120)** feature: MX-FP4 weights + MX-FP8
+activations with block-scaled tensor ops. Orin (SM87) builds with
+`NVFP4/W4A8 support: DISABLED` — use **INT8** (`FVK_PI05_RTX_FORCE_INT8=1`) instead.
+W4 weights are still stored in whole **bytes** (two 4-bit FP4 values per byte).
+See [deployment_orin.md](deployment_orin.md) § *Orin vs W4A8 (concept)* for the full explanation, plus **§ Q4 / “W4” without native 4-bit tensor cores** (llama.cpp vs FlashRT naming, and when 4-bit storage is still worth it).
+
 ---
 
 ## Performance Notes
@@ -293,7 +301,7 @@ degrades encoder cosine from 0.991 → 0.282 and is disabled).
 - Decoder cross-attention (**FA2, 103 µs/call**) is already near-optimal:
   custom WMMA kernels (including split-kv and 2-pass full-WMMA designs) were implemented
   and tested but all remain 37%–2.7× slower than FA2 for this shape; see `notes/`
-- ThorU (SM110) is ~3× faster primarily due to **Blackwell FP8 per-SM TOPS**, not SM count
+- ThorU (SM110) is ~3× faster primarily due to **higher FP8 per-SM TOPS** on SM110 vs INT8 on SM87, not SM count
   (ThorU: 20 SMs, Orin: 16 SMs — only 25% difference); see `docs/deployment_orin.md`
 - Vision attention (FA2) is faster on Orin than ThorU's custom nvjet kernels for these shapes
 - See `docs/deployment_orin.md` for full nsys+ncu profiling data

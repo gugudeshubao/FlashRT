@@ -478,6 +478,36 @@ Two clear regimes:
 | `qkv_split` after vision bias | (2.7 ms, 50% hit) | ~1-1.5 ms | low (already fused with RoPE in encoder, just not vision) |
 | `gelu_kernel` → vision GEMM epilogue | (2.3 ms) | ~1-1.5 ms | medium (custom GEMM-with-GELU) |
 
+#### bias_gelu_bf16 fusion — measured
+
+The simplest of the L2-driven candidates — fusing `add_bias_bf16` →
+`gelu_inplace` into a single `bias_gelu_bf16` kernel for the SigLIP
+FFN-up output — was implemented and benchmarked. Result:
+
+| Mode | p50 | Hz | Pipeline cosine vs baseline |
+|---|---:|---:|---|
+| Baseline | 128.0 ms | 7.81 | 1.000 (reference) |
+| **bias_gelu fused** | **127.3 ms** | **7.85** | **0.94-0.99** (fails lossless) |
+
+Microbench shows the fused kernel is genuinely 2.12× faster in
+isolation. The captured-graph speedup vanishes (most of the savings
+were Python launch overhead that the graph already eliminates),
+leaving ~0.7 ms p50 — sub-noise. Worse, the fused kernel keeps fp32
+between bias-add and GELU while the original rounds to bf16 between
+them, and 27 SigLIP layers amplify the per-step drift to a 0.94-0.99
+end-to-end action cosine.
+
+Pattern reinforces the [static encoder INT8 finding](#static-encoder-int8--landed-and-validated-but-doesnt-pass-lossless):
+**roofline-style fusion estimates over-predict the captured-graph
+ceiling** because the graph already amortizes most of the per-kernel
+overhead. Kernel + binding kept as opt-in (`bias_gelu_bf16`); not
+enabled by default.
+
+Lessons-learned for the remaining fusion candidates in the table
+above: expect the realized saving to be **~30-50% of the roofline
+estimate** when wired into the captured graph, and budget for a
+calibration / cosine validation pass per change.
+
 **Combined ceiling from L2-driven fusion: ~5-8 ms** ⇒ baseline 127 ms
 → ~120 ms / 8.3 Hz lossless. Compared to my earlier roofline-style
 "15-25 ms" estimate this is materially smaller. The L2 data confirms

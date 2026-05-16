@@ -17,6 +17,28 @@ void gate_silu_mul(const __nv_bfloat16* gate, const __nv_bfloat16* up,
 
 void gelu_inplace(__nv_bfloat16* x, int n, cudaStream_t stream = 0);
 
+// Fused bias-add + GELU (in-place). Replaces the add_bias_bf16 +
+// gelu_inplace pair on the SigLIP FFN-up output; saves one L2/DRAM
+// round-trip over the (seq × VIS_H) buffer per layer.
+//
+// Status (2026-05): kernel correctness verified (microbench cosine
+// 0.99999 vs the kernel-pair baseline) and 2.12× faster in isolation,
+// but **not enabled by default** — wiring it into the SigLIP pipeline
+// produced ~0.7 ms p50 latency win (sub-noise on Orin) and pipeline-
+// level action cosine 0.94-0.99 vs the original. The cosine drop comes
+// from the fused kernel keeping fp32 between bias-add and GELU while
+// the original kernel pair rounds to bf16 between them; the two paths
+// calibrate the downstream INT8 GEMMs against slightly different
+// activation distributions, and 27 SigLIP layers amplify the per-step
+// drift. Kept here as an opt-in primitive; a strict bf16-round
+// variant could fix the cosine by emulating the original's precision
+// boundary, but the gain is small enough that it isn't worth the risk
+// of further subtle numerics divergence.
+void bias_gelu_bf16(__nv_bfloat16* x, const __nv_bfloat16* bias,
+                    int seq_len, int dim, cudaStream_t stream = 0);
+void bias_gelu_fp16(__half* x, const __half* bias,
+                    int seq_len, int dim, cudaStream_t stream = 0);
+
 void gate_silu_mul_merged(const __nv_bfloat16* merged, __nv_bfloat16* out,
                            int seq, int half_dim, cudaStream_t stream = 0);
 
