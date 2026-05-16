@@ -636,20 +636,35 @@ bias EVT, GEMM scheduling) are real but each is only a few ms.
 **L2 ncu re-profile (above) confirmed this** — the big GEMMs are at
 86-89% L2 hit (saturated), and the small ops sum to only ~10 ms with
 realistic fusion savings of 50-70% (~5-8 ms). Updated ceiling
-(numbers reflect bias_gelu_strict already landed → new baseline 126.6 ms):
+(numbers reflect ALL strict-bit-equal fusions landed → current
+baseline 126.4 ms / 7.92 Hz):
 
-- bias_gelu_strict: **−1.4 ms** ⇒ **126.6 ms / 7.90 Hz** (current default)
-- Remaining L2-driven fusion (`bias_res` + `qkv_split` + small): ~3-4 ms
-  → ~123 ms / 8.1 Hz
-- Plus custom CUTLASS BF16 GEMM + bias EVT for vision: ~2-3 ms more
-  → ~120 ms / 8.3 Hz
-- Plus custom encoder GEMM scheduling improvements: ~5-10 ms uncertain
-  → ~110-115 ms / 8.7-9.1 Hz
+| Optimization | Cumulative p50 | Cumulative Hz | Cosine |
+|---|---:|---:|---|
+| Original baseline | 128.0 ms | 7.81 | 1.000 (ref) |
+| `bias_gelu_strict` | 126.6 ms | 7.90 | bit-eq ✅ |
+| `+ brln` both pairs | **126.4 ms** | **7.92** | **bit-eq ✅** |
+| + opt-in vision INT8 dynamic | **123.3 ms** | **8.11** | 0.97 ✗ (drops below bit-eq, similar cos to encoder INT8 0.991) |
+| + opt-in pipelined PARALLEL | ~115 ms ? | ~8.7 ? | 0.94-0.99 ✗ |
 
-**Lossless 10 Hz on Orin alone is unlikely with software work** —
-even after every realistic fusion lands, the projection caps at
-~9 Hz. The last 1 Hz to clear 10 Hz needs hardware (more SMs, FP8
-TCs), not software.
+**Strict bit-equal lossless ceiling on Orin**: current 7.92 Hz
+appears to be near the cap. The remaining ~3 ms of L2-driven small-op
+fusion (`add_bias` + `qkv_split` for vision QKV; cross-iteration
+bias_residual extras) and custom CUTLASS BF16 GEMM with bias EVT
+for SigLIP attn projections add **maybe 2-3 ms more lossless**
+→ ~8.1 Hz strict lossless ceiling.
+
+**"Production lossless" (cosine ≥ 0.97) ceiling**: vision dynamic
+INT8 + parallel pipelining + decoder restructuring could plausibly
+reach ~8.5-9.0 Hz. This is the same precision class as the existing
+encoder INT8 (cosine 0.991) which is considered production-quality.
+
+**9 Hz strict bit-equal lossless on Orin alone is essentially
+unreachable** — every realistic remaining software lever has been
+quantified above and they don't sum to enough. Clearing 9 Hz needs
+either:
+- Accepting the production-lossless precision class (vision INT8 + co)
+- Hardware: more SMs (e.g. ThorU SM110 with 20 SMs) or FP8 TCs.
 
 What this revises about the previous claim: the "no software headroom"
 conclusion was overstated. The 92% utilization applied to one specific

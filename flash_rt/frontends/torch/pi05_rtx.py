@@ -489,10 +489,13 @@ class Pi05TorchFrontendRtx:
         # decoder INT8 so all large GEMMs benefit from tensor-core acceleration.
         self._use_int8_encoder = self._force_int8_decoder or _enc_only
         self._int8_encoder_only = _enc_only
-        # Vision GEMMs (VIS_D=1152, seq=512): both dynamic and static INT8
-        # cause unacceptable encoder feature degradation (cosine~0.28 vs 0.99
-        # for encoder-only INT8). Vision stays in BF16.
-        self._use_int8_vision = False
+        # Vision GEMMs (VIS_D=1152, seq=512): static per-tensor INT8 was
+        # measured to break encoder cosine (0.991 → 0.282) — disabled
+        # permanently. Dynamic per-row INT8 is opt-in via
+        # FVK_PI05_RTX_INT8_VISION=1 (untested at branch time; enabling
+        # it requires cosine validation on the actual deployment).
+        self._use_int8_vision = (
+            os.environ.get("FVK_PI05_RTX_INT8_VISION", "0") == "1")
         self._use_int8_vision_static = False
         env_force_bf16 = os.environ.get("FVK_PI05_RTX_FORCE_BF16", "0") == "1"
         self._force_bf16 = (
