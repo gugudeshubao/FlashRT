@@ -30,6 +30,133 @@ Orin has no native FP8 tensor cores (SM87). The RTX pipeline detects
 this via `supports_fp8()` and activates INT8 fallback paths when
 `FVK_PI05_RTX_FORCE_INT8=1` is set.
 
+## Orin vs W4A8 (concept)
+
+**Orin (SM87) does not run W4A8.** Pi0.5 on Orin uses **INT8 (W8A8 rowwise)** for
+encoder and decoder GEMMs, not 4-bit weights.
+
+In this repo, **W4A8** means a **Blackwell-only** path: block-scaled **MX-FP4**
+weights (`float_e2m1_t`, 4 bits per weight) with **MX-FP8** activations
+(`float_e4m3_t`, 8 bits), fused on **SM120** tensor cores. CMake enables it
+only when `GPU_ARCH` is 120 or 120a; Orin builds log
+`NVFP4/W4A8 support: DISABLED (requires sm_120a, current: sm_87)`.
+See [`csrc/gemm/gemm_types.h`](../csrc/gemm/gemm_types.h) (`w4a8_gemm` namespace:
+`Arch = Sm120`, `OpClassBlockScaledTensorOp`).
+
+CMake gates NVFP4 / W4A8 at configure time:
+
+```cmake
+# CMakeLists.txt (excerpt)
+if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "120a")
+  set(ENABLE_NVFP4 ON)
+else()
+  set(ENABLE_NVFP4 OFF)   # Orin sm_87 → W4A8 kernels not built
+endif()
+```
+
+```mermaid
+flowchart LR
+  subgraph orin [Orin_SM87]
+    W8[W8_INT8_weights]
+    A8o[A8_INT8_activations]
+    IMMA[INT8_IMMA_tensor_cores]
+    W8 --> IMMA
+    A8o --> IMMA
+  end
+  subgraph blackwell [Blackwell_SM120]
+    W4[W4_FP4_weights]
+    A8b[A8_FP8_activations]
+    BS[BlockScaled_tensor_op]
+    W4 --> BS
+    A8b --> BS
+  end
+```
+
+| Platform | Pi0.5-style GEMMs | Notes |
+|---|---|---|
+| **Orin SM87** | INT8 weights + INT8 activations | IMMA INT8 tensor cores |
+| **ThorU SM110** | FP8 (when FP8 path enabled) | Native FP8 tensor cores |
+| **Blackwell SM120** | NVFP4 / W4A8 (optional in FlashRT) | FP4 packed weights + FP8 acts |
+
+### How “W4” fits in half a byte
+
+One weight is **4 bits**. **Two weights pack into one byte** (two nibbles).
+FlashRT packs MX-FP4 rows as `K/2` bytes per row: each `uint8_t` stores
+`(hi_nibble << 4) | (lo_nibble & 0x0F)` (see `quantize_bf16_to_mxfp4_cutlass_kernel`
+in [`csrc/kernels/quantize.cu`](../csrc/kernels/quantize.cu), guarded by
+`ENABLE_NVFP4`). Software still addresses **bytes**; the GEMM unpacks pairs of
+4-bit values inside the kernel or via hardware layout. MX formats also store
+**per-block scale factors** (separate from the nibbles), so total size is not
+exactly half of INT8 weights alone.
+
+**Clarification:** “W4” here is **FP4 (e2m1)**, not signed integer INT4. The “4”
+is bit width, not “integer quantization family.”
+
+Example packing (from `quantize_bf16_to_mxfp4_cutlass_kernel` when `ENABLE_NVFP4`):
+
+```cpp
+// K FP4 weights per row → K/2 bytes
+uint8_t* row_fp4 = fp4_data + (size_t)row * K / 2;
+uint8_t fp4_lo = float_to_fp4_e2m1(v0);
+uint8_t fp4_hi = float_to_fp4_e2m1(v1);
+row_fp4[idx / 2] = (fp4_hi << 4) | (fp4_lo & 0x0F);
+```
+
+Memory layout (one byte = two 4-bit codes):
+
+```
+1 byte (8 bits):
+┌────────┬────────┐
+│ FP4 #1 │ FP4 #0 │   ← high nibble (bits 7–4) | low nibble (bits 3–0)
+│ 4 bit  │ 4 bit  │
+└────────┴────────┘
+```
+
+### Common misconceptions
+
+1. **“W4 = INT4?”** In FlashRT’s W4A8 path, W4 is **FP4 (e2m1)**, not signed INT4.
+   The “4” is bit width, not an integer quantization family.
+2. **“Can Orin run W4A8?”** Not in this repo’s Orin build: there is no SM120
+   block-scaled tensor core, and the W4A8 CUTLASS path is not compiled in.
+3. **“How do you address half a byte?”** Storage is still **byte-addressed**;
+   two weights share one byte; readers split with `>> 4` and `& 0x0F`, or the
+   GEMM consumes the hardware’s packed layout directly.
+
+### Q4 / “W4” without native 4-bit tensor cores (llama.cpp analogy)
+
+Tools like **llama.cpp** often advertise **4-bit weights** (GGUF Q4\_\*, etc.)
+on CPUs or GPUs that have **no 4-bit MMA**. That is **not** the same path as
+FlashRT’s **W4A8** (MX-FP4 + MX-FP8 on SM120). There, “W4” usually means **packed
+integer (or mixed) quantization** in storage; at run time kernels **unpack**
+nibbles to int8 / fp16 / fp32 and run dot products with **existing SIMD or
+INT8/FP16 tensor cores** — i.e. **software-emulated** 4-bit inference.
+
+So “hardware only likes INT8” does **not** forbid 4-bit **storage**: you still
+save **DRAM traffic and capacity**. Whether that is a net win depends on the
+bottleneck (see next subsection).
+
+### When 4-bit storage is still worth it (and when it feels “wasted”)
+
+| Effect | Typical outcome |
+|---|---|
+| **Precision** | Quantized model is weaker than full precision — the price of fewer bits. |
+| **Compute** | Unpack + scale + accumulate can add **more instructions per MAC** than native FP16/INT8 GEMM. |
+| **Memory / BW** | Fewer bytes moved per weight — often the **dominant win** for huge, **memory-bound** models (large LLMs, small batch). |
+
+- **Memory- or capacity-bound** (model barely fits, weights dominate DRAM time):
+  Q4-style packing can still **speed up** end-to-end latency despite unpack cost,
+  and can be the **only** way to run the model on device.
+- **Compute-bound** (small matrices, already fast INT8/FP16 tensor paths, heavy unpack):
+  you may get **worse quality and similar or worse latency** — then native
+  **INT8** (Orin Pi0.5) or **FP8** (ThorU) is the better match than emulated W4.
+
+**Pi0.5 on Orin:** encoder GEMMs are large and already **~92% GPU util** in INT8;
+there is no SM120-style hardware W4A8, and **INT8 tensor cores** are the right
+precision/performance tradeoff — not “Q4 weights + unpack to emulate W4A8.”
+
+No code or runtime change is required on Orin: keep `FVK_PI05_RTX_FORCE_INT8=1`
+with INT8 encoder and decoder.
+
 ## Build
 
 ```bash
@@ -306,6 +433,64 @@ The 3× total gap is a **hardware gap** (FP8 TOPS), not a software gap
 in isolation**; the global picture across the full inference is more
 nuanced.
 
+### L2 cache analysis (ncu, full inference, 481 kernels, 72 ms profiled)
+
+Re-profiled on the current branch (2026-05) covering 481 kernels of one
+full inference. Orin SM87 has **4 MB L2 shared across 16 SMs**, so any
+cross-kernel reuse of weights or activations larger than ~4 MB will
+cause L2 thrashing.
+
+| Kernel | calls | time | **L2 hit** | L2 read | L2 write | Reuse pattern |
+|---|---:|---:|---:|---:|---:|---|
+| `cutlass_int8_gemm` (encoder INT8 GEMMs) | 51 | 28.4 ms | **89.4%** | 10.2 GB | 0.41 GB | ✅ tile-time weight reuse — saturated |
+| `ampere_bf16_gemm 128x128` (SigLIP attn proj) | 108 | 18.1 ms | **86.0%** | 6.8 GB | 0.49 GB | ✅ |
+| `add_bias_bf16` (vision bias adds) | 55 | 6.5 ms | 50.7% | 0.22 GB | 0.22 GB | ⚠️ post-GEMM read-modify-write |
+| `quantize_int8_rowwise` | 20 | 4.7 ms | **36.3%** | 0.33 GB | 0.10 GB | ❌ 2-pass over data |
+| `flash_fwd` (FA2) | 37 | 3.3 ms | 87.5% | 0.49 GB | 0.06 GB | ✅ |
+| `qkv_split_kernel` | 27 | 2.7 ms | 49.8% | 0.10 GB | 0.10 GB | ⚠️ reads bias-added GEMM output |
+| `gelu_kernel` (SigLIP) | 27 | 2.3 ms | 50.6% | 0.12 GB | 0.12 GB | ⚠️ |
+| `layer_norm_kernel` (SigLIP) | 55 | 1.9 ms | 51.6% | 0.07 GB | 0.06 GB | ⚠️ |
+| `bias_res_kernel` | 55 | 1.5 ms | **34.2%** | 0.13 GB | 0.06 GB | ❌ worst |
+| `residual_add_rms_norm_int8` (already fused) | 10 | 0.8 ms | 43.9% | 0.04 GB | 0.03 GB | ⚠️ |
+| `rms_norm_int8_rowwise` (already fused) | 11 | 0.7 ms | **35.6%** | 0.02 GB | 0.01 GB | ❌ post-GEMM, L2 thrashed |
+| `res_add_kernel` | 10 | 0.5 ms | 33.5% | 0.04 GB | 0.02 GB | ❌ |
+
+**Total L2 read traffic: ~18 GB** over 72 ms profiled. The 4 MB L2 is
+fully thrashed for any kernel mix that touches >4 MB of activation, so
+inter-kernel reuse is essentially zero — **L2 hit rate >85% comes
+entirely from intra-kernel tile reuse, not cross-kernel pipelining**.
+
+Two clear regimes:
+1. **Big GEMMs (encoder INT8, vision attn proj, FA2): 86-89% L2 hit** —
+   well-scheduled tile reuse, saturated, **no L2-side optimization
+   space**. Speedup here would require more SMs or faster TC.
+2. **Small post-GEMM ops (bias add, qkv_split, gelu, residual+norm):
+   34-51% L2 hit** — they read data the previous GEMM just wrote, but
+   the GEMM thrashed L2 in between, so they pay full DRAM cost. This
+   is the classic **producer-consumer fusion** signal.
+
+#### Fusion candidates the L2 data points to
+
+| Fusion | Source kernels | Time saved (estimate) | Risk |
+|---|---|---:|---|
+| Vision bias EVT into BF16 GEMM | `add_bias_bf16` (6.5 ms) | ~3-4 ms | medium — needs custom CUTLASS BF16 SM87 GEMM (`cublasLt SM87` doesn't accept BIAS epilogue) |
+| `bias_res_kernel` → into next op | (1.5 ms) | ~0.5-1 ms | low |
+| `qkv_split` after vision bias | (2.7 ms, 50% hit) | ~1-1.5 ms | low (already fused with RoPE in encoder, just not vision) |
+| `gelu_kernel` → vision GEMM epilogue | (2.3 ms) | ~1-1.5 ms | medium (custom GEMM-with-GELU) |
+
+**Combined ceiling from L2-driven fusion: ~5-8 ms** ⇒ baseline 127 ms
+→ ~120 ms / 8.3 Hz lossless. Compared to my earlier roofline-style
+"15-25 ms" estimate this is materially smaller. The L2 data confirms
+the small kernels really are post-GEMM cleanup work, but each is only
+0.5-7 ms — the sum of "all of them" is the cap, ~10 ms, and fusion
+savings are 50-70% of that, not 100%.
+
+**The L2 picture also rules out any path to >10 Hz that depends on
+better cache placement.** Orin's 4 MB L2 vs ~20 MB of layer-bound
+data means it cannot serve as cross-kernel scratch. The only L2-side
+optimization is **eliminating the cross-kernel boundary entirely via
+fusion** — which the analysis above bounds at ~5-8 ms.
+
 ### Refined headroom analysis (re-done 2026-05)
 
 Earlier this doc concluded "software optimizations have extracted most
@@ -376,9 +561,21 @@ quantize) actually only had ~1 ms of saving available because it
 was already mostly bandwidth-bound. The remaining levers (vision
 bias EVT, GEMM scheduling) are real but each is only a few ms.
 
-**Lossless 10 Hz on Orin alone is harder than the roofline suggests** —
-the path probably requires aggressive custom CUTLASS BF16 GEMMs *plus*
-GEMM scheduling work, both with significant engineering cost.
+**L2 ncu re-profile (above) confirmed this** — the big GEMMs are at
+86-89% L2 hit (saturated), and the small ops sum to only ~10 ms with
+realistic fusion savings of 50-70% (~5-8 ms). Updated ceiling:
+
+- After all realistic L2-driven fusion (~6 ms): **~121 ms / 8.3 Hz**
+- Plus full custom CUTLASS BF16 GEMM + bias EVT for vision (~3 ms more
+  on top of fusion already counted): **~118 ms / 8.5 Hz**
+- Plus custom encoder GEMM scheduling improvements (~5-10 ms,
+  uncertain): **~108-113 ms / 8.8-9.3 Hz**
+
+**Lossless 10 Hz on Orin alone is unlikely with software work** —
+the L2 data shows the optimization budget is tighter than the
+roofline estimate. Aggressive engineering can probably get to ~9 Hz,
+but the last 1 Hz to clear 10 Hz needs hardware (more SMs, FP8 TCs)
+not software.
 
 What this revises about the previous claim: the "no software headroom"
 conclusion was overstated. The 92% utilization applied to one specific
