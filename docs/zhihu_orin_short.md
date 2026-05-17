@@ -1,6 +1,6 @@
 # 在 Orin 上为 lossless 9 Hz 优化 Pi0.5：三个被推翻的"常识"
 
-> 背景：Pi0.5 是 Physical Intelligence 开源的 VLA 控制模型（PaliGemma 2B encoder + 300M 扩散 decoder + SigLIP 视觉），FlashRT 是它的实时推理引擎。本文跑在 Jetson AGX Orin 64GB（SM87，16 SMs，LPDDR5X 204 GB/s，无 native FP8）上。
+> 背景：Pi0.5 是 Physical Intelligence 开源的 VLA 控制模型，由 **PaliGemma-3B**（SigLIP-So400m 视觉 + Gemma-2B encoder）加上自己的 **300M 扩散 decoder** 组成。FlashRT 是它的实时推理引擎。本文跑在 Jetson AGX Orin 64GB（SM87，16 SMs，LPDDR5X 204 GB/s，无 native FP8）上。
 
 起点 128 ms / **7.81 Hz**，目标**严格 bit-equivalent**（cosine = 1.000、每帧 byte-identical）9 Hz。最终撞到 **8.04 Hz** lossless 上限——9 Hz 数学上过不去。这篇不写优化技巧，只挑三个让我反复在错误结论上原地打转的常识。
 

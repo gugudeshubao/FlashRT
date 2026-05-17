@@ -1,6 +1,6 @@
 # 在 Jetson Orin 上追无损 9 Hz：一次撞墙日记
 
-> 背景：Pi0.5 是 Physical Intelligence 开源的 VLA（Vision-Language-Action）控制模型，PaliGemma 2B encoder + 300M 扩散 decoder + SigLIP 视觉，输出 10 步动作 chunk。FlashRT 是它的实时推理引擎。本文跑在 Jetson AGX Orin 64GB（SM87，16 SMs，LPDDR5X 204 GB/s，无 native FP8）上做 INT8 lossless 推理。
+> 背景：Pi0.5 是 Physical Intelligence 开源的 VLA（Vision-Language-Action）控制模型，由 **PaliGemma-3B**（SigLIP-So400m 视觉 + Gemma-2B encoder）加上自己的 **300M 扩散 decoder** 组成，输出 10 步动作 chunk。FlashRT 是它的实时推理引擎。本文跑在 Jetson AGX Orin 64GB（SM87，16 SMs，LPDDR5X 204 GB/s，无 native FP8）上做 INT8 lossless 推理。
 >
 > 起点 7.81 Hz，目标**严格 bit-equivalent** 9 Hz。剧透：没成功。最终 8.04 Hz lossless。这篇记录为什么过不去。
 
