@@ -1,6 +1,8 @@
 # 在 Orin 上为 lossless 9 Hz 优化 Pi0.5：三个被推翻的"常识"
 
-Pi0.5 在 Jetson AGX Orin（SM87，16 SMs）跑 INT8 lossless 推理。起点 7.81 Hz，目标**严格 bit-equivalent** 9 Hz。最终撞到 8.04 Hz lossless 上限——9 Hz 数学上过不去。这篇不写优化技巧，只挑三个让我反复在错误结论上原地打转的常识。
+> 背景：Pi0.5 是 Physical Intelligence 开源的 VLA 控制模型（PaliGemma 2B encoder + 300M 扩散 decoder + SigLIP 视觉），FlashRT 是它的实时推理引擎。本文跑在 Jetson AGX Orin 64GB（SM87，16 SMs，LPDDR5X 204 GB/s，无 native FP8）上。
+
+起点 128 ms / **7.81 Hz**，目标**严格 bit-equivalent**（cosine = 1.000、每帧 byte-identical）9 Hz。最终撞到 **8.04 Hz** lossless 上限——9 Hz 数学上过不去。这篇不写优化技巧，只挑三个让我反复在错误结论上原地打转的常识。
 
 ## 1. "ncu 报 92% util 就饱和"——错。
 
@@ -65,6 +67,6 @@ return ...::run(...);  // default 128×128
 
 剩余所有软件杠杆相加 ~10-13 ms 也填不满 9 Hz 的 14 ms 缺口。9 Hz 在 Orin 单卡数学上过不去——要么换硬件（ThorU SM110 预估 22 Hz），要么接受非严格 lossless（cache_frames=2 已落地，12 Hz at cos=0.991）。
 
-代码全在 [feat/orin-pipelined-streaming](https://github.com/LiangSu8899/FlashRT/tree/feat/orin-pipelined-streaming)，每个 commit 都通过 6 帧固定噪声 maxabs=0 测试。
+代码全在 [feat/orin-pipelined-streaming](https://github.com/gugudeshubao/FlashRT/tree/feat/orin-pipelined-streaming)，每个 commit 都通过 6 帧固定噪声 maxabs=0 测试。
 
 —— 撞墙日记，写于发现"自己被一次污染的测试结果误导了几个小时"的第二天。

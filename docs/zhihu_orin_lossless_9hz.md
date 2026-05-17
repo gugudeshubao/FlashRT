@@ -1,6 +1,8 @@
 # 在 Jetson Orin 上追无损 9 Hz：一次撞墙日记
 
-> Pi0.5 (PaliGemma 2B encoder + 300M 扩散 decoder + SigLIP 视觉) 在 Jetson AGX Orin 64GB（SM87，16 SMs，LPDDR5X 204 GB/s，无 native FP8）上做 INT8 lossless 推理。起点 7.81 Hz，目标**严格 bit-equivalent** 9 Hz。剧透：没成功。最终 8.04 Hz lossless。这篇记录为什么过不去。
+> 背景：Pi0.5 是 Physical Intelligence 开源的 VLA（Vision-Language-Action）控制模型，PaliGemma 2B encoder + 300M 扩散 decoder + SigLIP 视觉，输出 10 步动作 chunk。FlashRT 是它的实时推理引擎。本文跑在 Jetson AGX Orin 64GB（SM87，16 SMs，LPDDR5X 204 GB/s，无 native FP8）上做 INT8 lossless 推理。
+>
+> 起点 7.81 Hz，目标**严格 bit-equivalent** 9 Hz。剧透：没成功。最终 8.04 Hz lossless。这篇记录为什么过不去。
 
 ---
 
@@ -266,7 +268,7 @@ ThorU（SM110）20 SM + 更高 per-SM TOPS + 原生 FP8 TC，同代码预估 22 
 
 ## 7. 现状 + 后续
 
-代码全部在 [feat/orin-pipelined-streaming](https://github.com/LiangSu8899/FlashRT/tree/feat/orin-pipelined-streaming) 分支：
+代码全部在 [feat/orin-pipelined-streaming](https://github.com/gugudeshubao/FlashRT/tree/feat/orin-pipelined-streaming) 分支：
 
 | Commit | 内容 | 收益 |
 |---|---|---|
