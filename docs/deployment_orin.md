@@ -705,6 +705,34 @@ trade-offs accepted. Clearing 9 Hz needs hardware: more SMs (e.g.
 ThorU SM110 with 20 SMs and Blackwell FP8 TC), where the existing
 pipeline is projected at ~22 Hz lossless.
 
+### Thor SM110 cross-check (measured 2026-05-18)
+
+To confirm the "Thor will be ~3× faster" claim, transferred the same
+`pi05_droid_pytorch` checkpoint to a Thor box and ran the FlashRT
+default Thor frontend (`Pi05TorchFrontendThor`, no Orin-side
+optimizations needed):
+
+| Hardware | p50 | Hz | vs Orin |
+|---|---:|---:|---:|
+| Orin SM87 (after all this branch's work) | 124.4 ms | **8.04** | 1.0× |
+| **Thor SM110 (FlashRT default, no tuning)** | **46.6 ms** | **21.46** | **2.67× faster** |
+| Doc claim (Pi0.5 Thor lossless) | 44 ms | 23 | 1.07× of measured |
+
+Thor's measured number is 7% slower than the doc figure — likely the
+doc was running an explicit FP8 path that the default frontend
+doesn't auto-enable on this checkpoint. Even so, **Thor on day-one
+defaults beats 9 Hz lossless by 2.4×**, which means:
+
+* The cross-call pipelining infrastructure landed in this branch
+  (snap K/V double-buffer, dual-stream frontend) is **not needed in
+  production**: Thor's single-stream path already clears the 9 Hz
+  bar by a wide margin.
+* It remains useful as a portable pattern for any future hardware
+  where the single-stream path doesn't have headroom.
+* For deployments stuck on Orin, the choice stays: 8.04 Hz strict
+  lossless / 12 Hz cache_frames=2 (cos 0.991) / 8.3 Hz production-
+  lossless with vision INT8.
+
 What this revises about the previous claim: the "no software headroom"
 conclusion was overstated. The 92% utilization applied to one specific
 GEMM shape under ncu microbench conditions; the global inference has
