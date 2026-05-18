@@ -62,10 +62,11 @@ return ...::run(...);  // default 128×128
 | + bias_gelu_strict（fusion） | 126.6 ms | 7.90 | ✅ |
 | + brln fusion（两对）| 126.4 ms | 7.92 | ✅ |
 | + INT8 tile dispatch | **124.4 ms** | **8.04** | ✅ |
+| —— 参考：Thor SM110 default frontend 实测 | 46.6 ms | **21.46** | (硬件不同) |
 
-**累计 +0.23 Hz，全部严格 bit-identical lossless**。
+**Orin 累计 +0.23 Hz，全部严格 bit-identical lossless**。Thor 同份 6.8 GB 检查点裸搬过去 default 单 stream 就 21.46 Hz——2.67× Orin，远超 9 Hz 目标。
 
-剩余所有软件杠杆相加 ~10-13 ms 也填不满 9 Hz 的 14 ms 缺口。9 Hz 在 Orin 单卡数学上过不去——要么换硬件（ThorU SM110 预估 22 Hz），要么接受非严格 lossless（cache_frames=2 已落地，12 Hz at cos=0.991）。
+剩余所有软件杠杆相加 ~10-13 ms 也填不满 9 Hz 的 14 ms 缺口。9 Hz 在 Orin 单卡数学上过不去——要么换硬件（**ThorU SM110 实测 21.46 Hz lossless**，把 6.8 GB 检查点搬过去裸跑 default frontend 没改任何代码就 2.67× Orin），要么接受非严格 lossless（cache_frames=2 已落地，12 Hz at cos=0.991）。
 
 代码全在 [feat/orin-pipelined-streaming](https://github.com/gugudeshubao/FlashRT/tree/feat/orin-pipelined-streaming)，每个 commit 都通过 6 帧固定噪声 maxabs=0 测试。
 

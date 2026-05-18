@@ -62,7 +62,7 @@ Pi0.5 18 层 encoder 总 INT8 算量约 2.2 TOPs。理论最低 = 2.2 / 60 = **3
 
 **这是并发执行的固有性质**，跟 atomic order 一起死锁。也是 Orin 16 SM 太少这事第一次咬人——SM 多的卡上两条 stream 真的能不抢 SM，atomic 顺序也就稳定。
 
-代码（snap K/V 双缓冲、噪声延 1 帧、流水线 frontend）保留为基础设施，等迁到 ThorU SM110 那边验证 GPU concurrency。
+代码（snap K/V 双缓冲、噪声延 1 帧、流水线 frontend）保留为基础设施。后来把 6.8 GB 检查点搬到 ThorU SM110 上裸跑 default frontend，**实测 46.6 ms / 21.46 Hz lossless**，2.67× Orin——也就是说**这套 pipelining 在生产上其实不需要**，Thor 单 stream 就够。详见末尾"现状 + 后续"。
 
 ---
 
@@ -187,10 +187,12 @@ return ...::run(...);  // default 128×128
 | + bias_gelu_strict | 126.6 ms | 7.90 | ✅ |
 | + brln fusion (两对) | 126.4 ms | 7.92 | ✅ |
 | + INT8 tile dispatch | **124.4 ms** | **8.04** | ✅ |
+| —— 参考：Thor SM110 default frontend 实测 | 46.6 ms | **21.46** | (硬件不同) |
 
-**累计 -3.6 ms / +0.23 Hz，全部严格 bit-equal lossless**。
+**Orin 累计 -3.6 ms / +0.23 Hz，全部严格 bit-equal lossless**。
+Thor 比 Orin 快 2.67×，default 单 stream 就过 9 Hz 2.4 倍。
 
-3 轮 50 iter 中位数确认稳定。每个 commit 都通过 6 帧固定噪声测试 maxabs=0 才合并。
+3 轮 50 iter 中位数确认稳定。每个 commit 都通过 6 帧固定噪声测试 maxabs=0 才合并；后来在 20 帧扩展集上重测 tile dispatch 仍然 maxabs=0。
 
 ---
 
@@ -220,7 +222,7 @@ production 加完上限：**~8.5-8.7 Hz**。
 **9 Hz 在 Orin 单卡上数学上过不去**——剩余所有软件杠杆相加 ~10-13 ms 也填不满。
 
 要继续往上走只能：
-- 换硬件（ThorU SM110，20 SM + Blackwell FP8 TC，同代码预估 ~22 Hz lossless）
+- 换硬件（ThorU SM110，20 SM + Blackwell FP8 TC，**实测 21.46 Hz lossless**，与 doc 标的 23 Hz 差 7%）
 - 接受非严格 lossless（cache_frames=2 已落地，12 Hz at cos=0.991，工程已成熟）
 
 ---
@@ -262,7 +264,7 @@ Orin GPU 只 16 个 SM。这导致：
 - atomic 反序产生数值漂移
 - 大 GEMM 分块容易出 partial-wave 浪费
 
-ThorU（SM110）20 SM + 更高 per-SM TOPS + 原生 FP8 TC，同代码预估 22 Hz。"加 4 个 SM" 不只是 25% 提升，是阶跃。
+ThorU（SM110）20 SM + 更高 per-SM TOPS + 原生 FP8 TC，**同份 6.8 GB 检查点裸搬过去实测 21.46 Hz lossless**——2.67× Orin。"加 4 个 SM" 不只是 25% 提升，是阶跃。
 
 ---
 
@@ -280,7 +282,7 @@ ThorU（SM110）20 SM + 更高 per-SM TOPS + 原生 FP8 TC，同代码预估 22 
 | dynamic vision INT8（opt-in） | per-row scale on SigLIP | production-lossless |
 
 下一步可能的方向：
-- 把流水线代码搬到 ThorU 验证是不是真能利用 GPU concurrency
+- ~~把流水线代码搬到 ThorU 验证是不是真能利用 GPU concurrency~~ → **已验证**：Thor 默认 frontend 就 21.46 Hz，单 stream 已经远超 9 Hz 目标，pipelining 在 Thor 上多余
 - 写自定义 CUTLASS BF16 GEMM with bias EVT for SigLIP（剩下最大单笔 lossless 杠杆）
 - 接受 cache_frames=2 路径（12 Hz at cos=0.991）作为生产部署
 
