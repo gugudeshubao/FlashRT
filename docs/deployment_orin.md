@@ -592,6 +592,43 @@ TC/SM × 1024 ops/cycle × 1.3 GHz), 204 GB/s LPDDR5X.
 | `quantize_int8_kernel_generic` | 4.7 ms | Vision static INT8 was disabled — investigate whether this kernel is now dead code | ~4 ms (if dead) |
 | Other small norms / residuals | 7.9 ms | More aggressive fusion / EVT epilogues | ~2 ms |
 
+### Action-quality cross-config comparison (synthetic, 20-frame fixed seed)
+
+LIBERO sim eval was attempted but the dependency chain on this Orin
+broke too many ways to be a quick test (libero egg-link → /tmp/LIBERO
+gone, then chain of `bddl`, `easydict`, `gym` missing, then strict pins
+on `transformers==4.21.1`/`numpy==1.22.4` that conflict with FlashRT's
+runtime env). Pivoted to a synthetic action-cosine sweep that drives
+20 frames of fixed (image, noise) seeds through three configs and
+compares action vectors directly.
+
+| Config | bit-eq frames | mean cos | min cos | mean maxabs |
+|---|---:|---:|---:|---:|
+| **Default** (INT8 + tile dispatch + brln + bias_gelu_strict) | (ref) | 1.000 | 1.000 | 0 |
+| `FVK_PI05_RTX_INT8_NO_TILE_DISPATCH=1` | **20/20** | 1.000 | 1.000 | 0 |
+| `FVK_PI05_RTX_INT8_VISION=1` (vision INT8 dynamic) | 0/20 | 0.974 | 0.937 | 0.296 |
+
+Reference: baseline action `|·|` mean = 0.382, max = 0.927.
+
+Two takeaways:
+
+**Tile dispatch is bit-equivalent at 20-frame scale.** The earlier
+6-frame validation might have been generous; 20 frames with random
+images and fixed noise still produce maxabs = 0 across every frame.
+This rules out the lingering question of whether tile dispatch's
+bit-equality was a small-N artifact.
+
+**Vision dynamic INT8 sits in the production-lossless precision class
+but with non-trivial per-dim deviation.** Mean cosine 0.974 is in line
+with the encoder K cosine 0.991 baseline that this codebase considers
+"production-lossless". But the per-dim maxabs of 0.30 (vs action |·|
+mean 0.38) means *individual action dimensions can deviate by ~80% of
+their typical magnitude*. Whether that's tolerable on a real robot
+task depends on robustness; the cosine alone doesn't answer it. The
+LIBERO sim was the right venue for that question; it remains
+unanswered until the dep chain is fixed (or the test is moved to a
+different machine with a working sim install).
+
 ### Static encoder INT8 — landed and validated, but doesn't pass lossless
 
 The `quantize_int8_rowwise_static` kernel (single-pass, no per-row amax
