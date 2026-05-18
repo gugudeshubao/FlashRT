@@ -77,7 +77,8 @@ class Pi05TorchFrontendThor:
     # -----------------------------------------------------------------------
 
     def __init__(self, checkpoint_dir: str, num_views: int = 2,
-                 use_cuda_graph: bool = True, autotune: int = 3):
+                 use_cuda_graph: bool = True, autotune: int = 3,
+                 use_fp8: bool = True):
         """
         Args:
             autotune: CUDA Graph autotune trials per set_prompt().
@@ -87,6 +88,7 @@ class Pi05TorchFrontendThor:
         checkpoint_dir = pathlib.Path(checkpoint_dir)
         self.num_views = num_views
         self.use_cuda_graph = use_cuda_graph
+        self.use_fp8 = bool(use_fp8)
         self.autotune = int(autotune) if autotune is not True else 3
         if autotune is False:
             self.autotune = 0
@@ -195,7 +197,20 @@ class Pi05TorchFrontendThor:
         #   self._ae_w_scales                                 (72 fp32 scales)
         #   self._{attn,ffn}_mod_{w,b}                        (18-layer lists)
         _src = SafetensorsSource(str(safetensors_path), device='cuda')
-        WeightLoader(source=_src, target=self, spec=build_spec()).run()
+        WeightLoader(source=_src, target=self,
+                     spec=build_spec(use_fp8=self.use_fp8)).run()
+        # FP16 path: spec drops Quant() / scale_into, so _sig_alpha,
+        # _enc_w_scales, _ae_w_scales never get populated. Provide
+        # empty placeholders so downstream pointer-dict construction
+        # (which still reads these attrs) stays happy — the FP16
+        # forward branches ignore them.
+        if not self.use_fp8:
+            if not hasattr(self, '_sig_alpha'):
+                self._sig_alpha = []
+            if not hasattr(self, '_enc_w_scales'):
+                self._enc_w_scales = []
+            if not hasattr(self, '_ae_w_scales'):
+                self._ae_w_scales = []
 
         self.embedding_weight = g('paligemma_with_expert.paligemma.lm_head.weight')
 
@@ -243,6 +258,12 @@ class Pi05TorchFrontendThor:
         self._sig_attn   = torch.empty(S_sig, D_sig, dtype=fp16, device='cuda')
         self._sig_hidden = torch.empty(S_sig, H_sig, dtype=fp16, device='cuda')
         self._sig_hid_fp8 = torch.zeros(S_sig * H_sig, dtype=torch.uint8, device='cuda')
+        # FP16 path needs a dedicated O/Down GEMM output buffer (one
+        # epilogue away from the residual add). The x_norm scratch
+        # aliases ``_sig_attn`` since the LN output is consumed by the
+        # QKV GEMM before attention overwrites the buffer.
+        self._sig_fg = (torch.empty(S_sig, D_sig, dtype=fp16, device='cuda')
+                        if not self.use_fp8 else None)
 
         self._sig_bufs = {
             'x':       self._sig_x.data_ptr(),
@@ -251,6 +272,8 @@ class Pi05TorchFrontendThor:
             'attn_out': self._sig_attn.data_ptr(),
             'hidden':  self._sig_hidden.data_ptr(),
             'hid_fp8': self._sig_hid_fp8.data_ptr(),
+            'x_norm':  self._sig_attn.data_ptr(),
+            'fg':      self._sig_fg.data_ptr() if self._sig_fg is not None else 0,
         }
         self._sig_dims = {
             'S': S_sig, 'D': D_sig, 'H': H_sig,
@@ -295,7 +318,11 @@ class Pi05TorchFrontendThor:
         #   self._enc_gu_w    list of [2*H, D]    fp8 (fused post-attn norm)
         #   self._enc_d_w     list of [H, D]      fp8
         #   self._enc_w_scales  host list of Le*4 floats (order: q, o, gu, d per layer)
-        self._enc_w_dev = torch.tensor(self._enc_w_scales, dtype=torch.float32, device='cuda')
+        # When use_fp8=False the spec skips Quant() so _enc_w_scales is
+        # not populated; keep an empty tensor so downstream pointer
+        # arithmetic still works (the FP16 path never reads it).
+        _enc_w_scales = getattr(self, '_enc_w_scales', []) or [0.0] * (Le * 4)
+        self._enc_w_dev = torch.tensor(_enc_w_scales, dtype=torch.float32, device='cuda')
 
         # RoPE table
         inv_freq = 1.0 / (10000 ** (torch.arange(0, 256, 2, dtype=torch.float32, device='cuda') / 256))
@@ -322,6 +349,11 @@ class Pi05TorchFrontendThor:
         self._enc_hidden = torch.empty(Se_max, He, dtype=fp16, device='cuda')
         self._enc_hid_fp8 = torch.zeros(Se_max * He, dtype=torch.uint8, device='cuda')
         self._enc_fg     = torch.empty(Se_max, De, dtype=fp16, device='cuda')
+        # All-ones gamma for the FP16 noweight RMSNorm (encoder uses
+        # ``rms_norm_fp8_noweight_fp16`` in the FP8 path; ``rms_norm_fp16``
+        # takes a weight pointer, so we feed it ones for parity).
+        self._enc_ones_fp16 = (torch.ones(De, dtype=fp16, device='cuda')
+                               if not self.use_fp8 else None)
 
         # ===============================================================
         # Decoder / AE  (18 layers, 10 steps)
@@ -344,7 +376,8 @@ class Pi05TorchFrontendThor:
         self._aow = g('action_out_proj.weight').t().contiguous() * (-1.0 / steps)
         self._aob = g('action_out_proj.bias') * (-1.0 / steps)
 
-        self._ae_w_dev = torch.tensor(self._ae_w_scales, dtype=torch.float32, device='cuda')
+        _ae_w_scales = getattr(self, '_ae_w_scales', []) or [0.0] * (La * 4)
+        self._ae_w_dev = torch.tensor(_ae_w_scales, dtype=torch.float32, device='cuda')
 
         # Time conditioning weights
         self._time_mlp_in_w  = g('time_mlp_in.weight')
@@ -1004,7 +1037,16 @@ class Pi05TorchFrontendThor:
         self._capture_siglip_graph()
 
         # ---- Calibrate FP8 scales (using SigLIP warmup output in enc_x) ----
-        self._calibrate(Se)
+        if self.use_fp8:
+            self._calibrate(Se)
+        else:
+            # FP16 path: no calibration needed; populate dummy scales /
+            # alpha so the enc/ae forward dicts stay shape-compatible
+            # (the FP16 branches never read them).
+            self._enc_calib_scales = torch.zeros(self.Le * 4, dtype=torch.float32, device='cuda')
+            self._enc_alpha_host = [1.0] * (self.Le * 4)
+            self._ae_calib_scales = torch.zeros(self.La * 4, dtype=torch.float32, device='cuda')
+            logger.info("use_fp8=False — skipping FP8 calibration (FP16 baseline)")
 
         # ---- Capture encoder+decoder graph ----
         if self.autotune > 0:
@@ -1227,7 +1269,8 @@ class Pi05TorchFrontendThor:
             self._patch_embed_ops(0)
             self._sig_x.zero_()  # match production: SigLIP sees zeros
             siglip_forward(self._gemm, fvk, self._sig_bufs, self._sig_weights,
-                           self._sig_dims, stream=0, attn=self._attn)
+                           self._sig_dims, stream=0, attn=self._attn,
+                           use_fp8=self.use_fp8)
             self._postln_project_ops(0)
         torch.cuda.synchronize()
 
@@ -1239,7 +1282,8 @@ class Pi05TorchFrontendThor:
             self._siglip_graph.capture_begin()
             self._patch_embed_ops(s_int)
             siglip_forward(self._gemm, fvk, self._sig_bufs, self._sig_weights,
-                           self._sig_dims, stream=s_int, attn=self._attn)
+                           self._sig_dims, stream=s_int, attn=self._attn,
+                           use_fp8=self.use_fp8)
             self._postln_project_ops(s_int)
             self._siglip_graph.capture_end()
         torch.cuda.synchronize()
@@ -1266,6 +1310,11 @@ class Pi05TorchFrontendThor:
             'hid_fp8': self._enc_hid_fp8.data_ptr(),
             'fg':      self._enc_fg.data_ptr(),
             'ctx':     self._ctx,
+            # FP16 path: x_norm aliases _enc_attn (same size, disjoint
+            # lifetime); ones is the all-ones vector for noweight RMS.
+            'x_norm':  self._enc_attn.data_ptr(),
+            'ones':    (self._enc_ones_fp16.data_ptr()
+                        if self._enc_ones_fp16 is not None else 0),
         }
         enc_weights = {
             'qkv_w':     [w.data_ptr() for w in self._enc_qkv_w],
@@ -1326,9 +1375,11 @@ class Pi05TorchFrontendThor:
         for _ in range(3):
             self._Kc.zero_(); self._Vc.zero_()
             encoder_forward(self._gemm, fvk, enc_bufs, enc_weights,
-                            enc_dims, stream=0, attn=self._attn)
+                            enc_dims, stream=0, attn=self._attn,
+                            use_fp8=self.use_fp8)
             decoder_forward(self._ctx, fvk, ae_bufs, ae_weights,
-                            ae_dims, stream=0, attn=self._attn)
+                            ae_dims, stream=0, attn=self._attn,
+                            use_fp8=self.use_fp8)
         torch.cuda.synchronize()
 
         # Capture
@@ -1339,9 +1390,11 @@ class Pi05TorchFrontendThor:
             self._enc_ae_graph.capture_begin()
             self._Kc.zero_(); self._Vc.zero_()
             encoder_forward(self._gemm, fvk, enc_bufs, enc_weights,
-                            enc_dims, stream=s_int, attn=self._attn)
+                            enc_dims, stream=s_int, attn=self._attn,
+                            use_fp8=self.use_fp8)
             decoder_forward(self._ctx, fvk, ae_bufs, ae_weights,
-                            ae_dims, stream=s_int, attn=self._attn)
+                            ae_dims, stream=s_int, attn=self._attn,
+                            use_fp8=self.use_fp8)
             self._enc_ae_graph.capture_end()
         torch.cuda.synchronize()
         logger.info("Enc+AE CUDA graph captured (Se=%d)", Se)
@@ -1951,7 +2004,10 @@ class Pi05TorchFrontendThor:
         self._siglip_graph.replay()
 
         # ---- Lazy real-data recalibration on first call ----
-        if not self._real_data_calibrated:
+        # Skip when use_fp8=False: the FP16 baseline path has no FP8
+        # scales to refresh, and ``_recalibrate_with_real_data`` reads
+        # FP8-specific attrs.
+        if self.use_fp8 and not self._real_data_calibrated:
             torch.cuda.synchronize()
             self._recalibrate_with_real_data()
             self._real_data_calibrated = True

@@ -375,17 +375,17 @@ class Pi05BatchedPipeline(Pi05Pipeline):
             fvk.quantize_fp8_static(
                 act_bf16_ptr, act_fp8_ptr, static_scale_ptr, act_n,
                 stream=stream)
-            self.gemm.fp8_nn_dev(
+            self._fp8_matmul(
                 act_fp8_ptr, w_fp8_ptr, out_bf16_ptr,
-                M, N, K, static_scale_ptr, w_scale_ptr, stream=stream)
+                M, N, K, static_scale_ptr, w_scale_ptr, stream)
         else:
             layer_scale = self._fp8_scale_buf(weight_name)
             fvk.quantize_fp8_device(
                 act_bf16_ptr, act_fp8_ptr, layer_scale.ptr.value, act_n,
                 stream=stream)
-            self.gemm.fp8_nn_dev(
+            self._fp8_matmul(
                 act_fp8_ptr, w_fp8_ptr, out_bf16_ptr,
-                M, N, K, layer_scale.ptr.value, w_scale_ptr, stream=stream)
+                M, N, K, layer_scale.ptr.value, w_scale_ptr, stream)
 
     # ══════════════════════════════════════════════════════════════════
     #   Helper: per-layer batched KV cache pointers
@@ -1089,7 +1089,7 @@ class Pi05BatchedPipeline(Pi05Pipeline):
                 act_scale_ptr = self.fp8_act_scales[name_prefix].ptr.value
                 act_buf = (Bb["vis_act_fp8_large_b2"] if K_val == VIS_H
                            else Bb["vis_act_fp8_b2"])
-                gemm.autotune_fp8_nn_dev(
+                self._autotune_fp8_matmul(
                     act_buf.ptr.value, w_fp8_ptr, Bb[out_key].ptr.value,
                     M_val, N_val, K_val, act_scale_ptr, w_scale_ptr)
 
@@ -1105,7 +1105,7 @@ class Pi05BatchedPipeline(Pi05Pipeline):
                 act_scale_ptr = self.fp8_act_scales[name_prefix].ptr.value
                 act_buf = (Bb["enc_act_fp8_large_b2"] if K_val == ENC_H
                            else Bb["enc_act_fp8_b2"])
-                gemm.autotune_fp8_nn_dev(
+                self._autotune_fp8_matmul(
                     act_buf.ptr.value, w_fp8_ptr, Bb[out_key].ptr.value,
                     M_val, N_val, K_val, act_scale_ptr, w_scale_ptr)
 
@@ -1121,7 +1121,7 @@ class Pi05BatchedPipeline(Pi05Pipeline):
                 act_scale_ptr = self.fp8_act_scales[name_prefix].ptr.value
                 act_buf = (Bb["dec_act_fp8_large_b2"] if K_val == DEC_H
                            else Bb["dec_act_fp8_b2"])
-                gemm.autotune_fp8_nn_dev(
+                self._autotune_fp8_matmul(
                     act_buf.ptr.value, w_fp8_ptr, Bb[out_key].ptr.value,
                     M_val, N_val, K_val, act_scale_ptr, w_scale_ptr)
 

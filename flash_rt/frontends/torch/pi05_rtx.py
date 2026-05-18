@@ -344,6 +344,31 @@ def _quantize_fp8_e4m3(w_bf16: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor
     return w_fp8, scale_tensor
 
 
+def _select_fp8_layout(hardware: Optional[str], fp8_layout: Optional[str]) -> str:
+    """Choose the Pi0.5 FP8 weight layout.
+
+    ``kn`` is the existing SM120 path: weights are stored as [K,N] and use
+    ``fp8_nn_dev``. ``nk`` is the SM89-compatible path: weights are stored
+    as [N,K] and use ``fp8_nt_dev``.
+    """
+    if fp8_layout is not None:
+        if fp8_layout not in ("kn", "nk"):
+            raise ValueError(f"fp8_layout must be 'kn' or 'nk', got {fp8_layout!r}")
+        return fp8_layout
+    if hardware == "rtx_sm89":
+        return "nk"
+    if hardware == "rtx_sm120":
+        return "kn"
+    try:
+        if torch.cuda.is_available():
+            major, minor = torch.cuda.get_device_capability()
+            if major == 8 and minor == 9:
+                return "nk"
+    except Exception:
+        pass
+    return "kn"
+
+
 def _precompute_decoder_styles(ckpt: dict, chunk_size: int,
                                num_steps: int = NUM_STEPS_DEFAULT) -> dict:
     """Pre-compute the time-MLP + per-layer style modulations in torch.
@@ -448,7 +473,10 @@ class Pi05TorchFrontendRtx:
                  vision_pool_factor: int = 1,
                  vision_num_layers: Optional[int] = None,
                  cache_frames: int = 1,
-                 use_tiny_q_attn: bool = False):
+                 use_tiny_q_attn: bool = False,
+                 use_fp8: bool = True,
+                 hardware: Optional[str] = None,
+                 fp8_layout: Optional[str] = None):
         checkpoint_dir = pathlib.Path(checkpoint_dir)
         self.num_views = int(num_views)
         self.chunk_size = int(chunk_size)
@@ -465,6 +493,8 @@ class Pi05TorchFrontendRtx:
         from flash_rt.models.pi05.pipeline_rtx import VIS_L as _VIS_L
         self._vision_num_layers = _VIS_L if vision_num_layers is None else int(vision_num_layers)
         # _use_int8_vision_static is set after _force_int8_decoder below
+        self.use_fp8 = bool(use_fp8)
+        self.fp8_layout = _select_fp8_layout(hardware, fp8_layout)
 
         self.latency_records: list[float] = []
         self.calibrated = False
@@ -539,7 +569,7 @@ class Pi05TorchFrontendRtx:
         self._int8_weights: dict = {}
         self._int8_store: list = []
         self._int8_weight_scales: dict[str, torch.Tensor] = {}
-        if not self._force_bf16 and not self._force_int8_decoder:
+        if self.use_fp8 and not self._force_bf16 and not self._force_int8_decoder:
             self._quantize_all_fp8()
         if self._force_int8_decoder:
             self._quantize_decoder_int8()
@@ -574,21 +604,12 @@ class Pi05TorchFrontendRtx:
             self.chunk_size, ACTION_DIM, dtype=bf16, device="cuda")
         self._noise_out = torch.empty(
             self.chunk_size, ACTION_DIM, dtype=bf16, device="cuda")
-        self._cudart = ctypes.CDLL("libcudart.so")
-        # Be explicit about libcudart function signatures. On some
-        # Python/CUDA/aarch64 combinations, leaving ctypes to infer
-        # the argument types can corrupt pointer-sized arguments and
-        # crash inside the first calibration-time D2D copy.
-        self._cudart.cudaMemcpyAsync.argtypes = [
-            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t,
-            ctypes.c_int, ctypes.c_void_p,
-        ]
-        self._cudart.cudaMemcpyAsync.restype = ctypes.c_int
-        self._cudart.cudaStreamSynchronize.argtypes = [ctypes.c_void_p]
-        self._cudart.cudaStreamSynchronize.restype = ctypes.c_int
+        from flash_rt.core.cuda_buffer import _cudart
+        self._cudart = _cudart
 
-        logger.info("Pi05TorchFrontendRtx initialised (num_views=%d, chunk=%d)",
-                    self.num_views, self.chunk_size)
+        logger.info(
+            "Pi05TorchFrontendRtx initialised (num_views=%d, chunk=%d, fp8_layout=%s)",
+            self.num_views, self.chunk_size, self.fp8_layout)
 
     def _pipeline_precision_kwargs(self) -> dict:
         if self._force_int8_decoder or getattr(self, "_int8_encoder_only", False):
@@ -622,8 +643,8 @@ class Pi05TorchFrontendRtx:
                 "use_int8_vision_static": False,
             }
         return {
-            "use_fp8": True,
-            "use_fp8_decoder": True,
+            "use_fp8": self.use_fp8,
+            "use_fp8_decoder": self.use_fp8,
             "use_int8_decoder": False,
             "use_int8_encoder": False,
             "use_int8_vision": False,
@@ -652,7 +673,11 @@ class Pi05TorchFrontendRtx:
         fp8 = self._fp8_weights
 
         def quant(name: str, w: torch.Tensor):
-            w_fp8, scale = _quantize_fp8_e4m3(w.contiguous())
+            if self.fp8_layout == "nk":
+                w = w.t().contiguous()
+            else:
+                w = w.contiguous()
+            w_fp8, scale = _quantize_fp8_e4m3(w)
             store.append(w_fp8)
             store.append(scale)
             fp8[name] = (w_fp8.data_ptr(), scale.data_ptr())
@@ -685,7 +710,7 @@ class Pi05TorchFrontendRtx:
             quant(f"decoder_ffn_gate_up_w_{i}", gate_up)
             quant(f"decoder_ffn_down_w_{i}", W["decoder_ffn_down_w"][i])
 
-        logger.info("FP8 quantized %d GEMM weights", len(fp8))
+        logger.info("FP8 quantized %d GEMM weights (layout=%s)", len(fp8), self.fp8_layout)
 
     def _quantize_decoder_int8(self) -> None:
         """Pre-quantize the decoder hot-path GEMM weights to INT8."""
@@ -854,6 +879,7 @@ class Pi05TorchFrontendRtx:
             # FP8 quantized weights
             "fp8": self._fp8_weights,
             "int8": self._int8_weights,
+            "fp8_layout": self.fp8_layout,
 
             # Precomputed decoder styles (numpy bf16 as uint16 view)
             "precomputed": self._precomputed_styles,
@@ -1802,8 +1828,6 @@ class Pi05TorchFrontendRtx:
                 max_prompt_len=target_len,
                 chunk_size=self.chunk_size,
                 **self._pipeline_precision_kwargs())
-
-        # Also seed the parent's B=1 lang slot from sample 0; the parent's
         # B=1 pipeline path is what calibrate_fp8 uses for FP8 scale collection.
         self.pipeline.set_language_embeds(padded_np_list[0])
         self.pipeline.set_language_embeds_batch(padded_np_list)

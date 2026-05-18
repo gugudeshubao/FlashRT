@@ -18,6 +18,7 @@ in Phase 2) that quantizes weights into fvk-compatible layouts.
 
 from __future__ import annotations
 
+import collections
 import os
 from typing import Any
 
@@ -87,7 +88,7 @@ class Qwen36TorchFrontendRtx:
         """
         self.checkpoint_path = checkpoint_path
         self.device = device
-        self.max_seq = int(max_seq)
+        self._user_max_seq = int(max_seq)
         self._tokenizer = None
         self._prompt_ids = None
         self._pipeline: Qwen36Pipeline | None = None
@@ -98,12 +99,51 @@ class Qwen36TorchFrontendRtx:
                 f"quant must be 'fp8' or 'nvfp4', got {quant!r}")
         self._quant_format = quant
 
+        # Auto-route: above ``LONG_CTX_THRESHOLD`` the BF16 KV cache
+        # alone is too big to fit a 32 GB card alongside the model
+        # (16 layers × max_seq × 4 × 256 × 2 bytes for K + V = 32 KB
+        # per token, so 32K context = 1 GB just for K, 2 GB for K+V,
+        # on top of a ~30 GB baseline). The fix is to route to the
+        # TurboQuant (TQ) packed-cache path: BF16 KV is shrunk to a
+        # 64-row dummy and persistent KV lives in NVFP4-packed form
+        # (~1.83x compression at 1-byte idx, ~5x at bit-pack).
+        # Spec decode is *not* yet integrated with TQ (Phase 3D
+        # follow-up), so long-ctx mode falls back to single-token
+        # decode (~30-40 tok/s eager, vs ~100-130 tok/s spec on
+        # short-ctx). This is the documented trade-off and matches
+        # the perf grid in docs/qwen36_nvfp4.md §4.
+        if quant == 'nvfp4' and self._user_max_seq > self.LONG_CTX_THRESHOLD:
+            # Long-ctx mode: allocate BF16 buffers at a small floor
+            # (the BF16 KV cache will be shrunk to a 64-row dummy
+            # immediately after init, and the per-step bf16 scratches
+            # like _h_a/_h_b only ever read [:1] or [:K] rows so they
+            # don't need to scale with max_seq). The TQ packed cache
+            # then grows KV coverage out to ``user_max_seq``.
+            bf16_init_seq = 2048
+            self._long_ctx_mode = True
+        else:
+            bf16_init_seq = self._user_max_seq
+            self._long_ctx_mode = False
+        # ``self.max_seq`` is the value used to size the BF16 init.
+        # ``self._user_max_seq`` is what the user asked for — that's
+        # what the TQ packed cache grows to in long-ctx mode, and
+        # what gets reported back via ``buffer_summary`` etc.
+        self.max_seq = int(bf16_init_seq)
+
         # Phase 2.3b4 own-forward state (populated by _alloc_buffers).
         self._weights = None         # WeightHandles
         self._bufs: dict | None = None
         self._attn = None            # RtxFlashAttnBackendQwen36
 
         if quant == 'fp8':
+            if self._long_ctx_mode:
+                raise NotImplementedError(
+                    'long-context auto-route (max_seq > '
+                    f'{self.LONG_CTX_THRESHOLD}) is implemented for '
+                    "quant='nvfp4' only. The FP8 path has no "
+                    'TurboQuant packed-cache integration; pass a '
+                    "smaller max_seq or use quant='nvfp4'."
+                )
             # Existing FP8 path — completely unchanged behavior.
             self._load_hf_model()
             self._load_mtp_weights()
@@ -114,6 +154,12 @@ class Qwen36TorchFrontendRtx:
             # no MTP for now (MTP head reuse from FP8 ckpt is a
             # follow-up; spec decode requires MTP).
             self._load_nvfp4_path(alloc_own_forward_buffers)
+            if self._long_ctx_mode and alloc_own_forward_buffers:
+                self._enter_long_ctx_mode()
+                # Buffers are sized at the BF16 init seq, but the
+                # user-facing max_seq reflects what they asked for —
+                # the TQ packed cache covers up to user_max_seq.
+                self.max_seq = self._user_max_seq
 
     # ---------- Phase 1 weight loading (HF path) ----------
 
@@ -195,6 +241,53 @@ class Qwen36TorchFrontendRtx:
     # _K_logits_buf at vocab=248320 is 16*248320*2 = 7.6 MB), tiny vs
     # the 28-30 GB main weight footprint.
     MAX_Q_SEQ: int = 16
+
+    # Per-cache LRU bound on lazily captured CUDA Graphs. Each
+    # ``_ensure_*_graph_*`` method captures a graph keyed by cur_pos
+    # (or (cur_pos, K), or eff_ctx) the first time that key is used,
+    # then replays on every subsequent call with that key. Without a
+    # bound, long-running servers that see many distinct shapes grow
+    # the cache linearly with the number of distinct cur_pos values
+    # observed and eventually OOM (GitHub issue: NVFP4 server VRAM
+    # leak on varied prompt lengths). The bound is per-cache, so the
+    # total captured-graph budget across all 4 NVFP4 caches is roughly
+    # 4 × ``GRAPH_CACHE_MAX``. Tuning notes:
+    #   - For chat-style traffic with ``max_seq <= 8K``, the default
+    #     of 256 is comfortably above the working set (one bucket per
+    #     observed cur_pos value, i.e. 8K positions worst-case but
+    #     the hot set is much smaller).
+    #   - All graphs allocate from a single shared mempool
+    #     (``self._graph_mempool``), so eviction reclaims pool memory
+    #     as soon as the evicted graph is GC'd.
+    #   - Override at process start via env
+    #     ``FLASHRT_QWEN36_GRAPH_CACHE_MAX``; setting it to ``0``
+    #     disables the bound (legacy unbounded behaviour, only safe
+    #     when the calling pattern caps cur_pos by construction).
+    GRAPH_CACHE_MAX: int = int(
+        os.environ.get('FLASHRT_QWEN36_GRAPH_CACHE_MAX', '256'))
+
+    # Auto-route threshold (NVFP4 only). At ``max_seq`` above this,
+    # the constructor switches into long-ctx mode: BF16 KV buffers
+    # are allocated at this threshold (small) and persistent KV is
+    # served by the TurboQuant packed cache, which compresses 1.83x
+    # at 1-byte idx (~5x at bit-pack). Spec decode is currently only
+    # available below the threshold; long-ctx mode does single-token
+    # decode (~30-40 tok/s) but supports up to 256 K context on a
+    # 32 GB card.
+    #
+    # Tuning notes:
+    #   - 16384 is the default because at max_seq=16K the BF16 KV is
+    #     ~1 GB, leaving comfortable headroom on a 32 GB card after
+    #     the model and scratches load. At 32 GB BF16 KV is 2 GB and
+    #     there is essentially no headroom for capture transients.
+    #   - Override via env ``FLASHRT_QWEN36_LONG_CTX_THRESHOLD``.
+    #   - Setting to 0 forces every NVFP4 instance into long-ctx
+    #     mode (useful if you want consistent long-ctx behaviour
+    #     across short and long requests).
+    #   - Setting it very high (e.g. 1_000_000) effectively disables
+    #     auto-route — useful only on cards with > 32 GB.
+    LONG_CTX_THRESHOLD: int = int(
+        os.environ.get('FLASHRT_QWEN36_LONG_CTX_THRESHOLD', '16384'))
 
     # ---- DFlash hidden-tap capture (N6 phase) -------------------------
     # When forward_own_decode_K_nvfp4 is called with tap_buf set, the
@@ -479,7 +572,13 @@ class Qwen36TorchFrontendRtx:
         self._static_token_id = torch.zeros(
             1, 1, device=device, dtype=torch.long,
         )
-        self._captured_graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        # Shared mempool for every captured graph in this instance.
+        # Without this, ``torch.cuda.graph(g, stream=gs)`` defaults to
+        # a *private* mempool per graph; with N captured graphs the
+        # per-graph workspace overhead is paid N times instead of once.
+        self._graph_mempool = torch.cuda.graph_pool_handle()
+        self._captured_graphs: collections.OrderedDict[
+            int, torch.cuda.CUDAGraph] = collections.OrderedDict()
 
         # Phase 6 D4-9: per-cur_pos CUDA Graph cache for the spec
         # decode S=K+1 verify forward. Uses static input buffers so
@@ -495,8 +594,9 @@ class Qwen36TorchFrontendRtx:
         self._verify_static_sin = torch.empty(
             1, self.MAX_Q_SEQ, 64, device=device, dtype=bf16,
         )
-        self._captured_verify_graphs: dict[
-            tuple[int, int], torch.cuda.CUDAGraph] = {}
+        self._captured_verify_graphs: collections.OrderedDict[
+            tuple[int, int], torch.cuda.CUDAGraph,
+        ] = collections.OrderedDict()
 
         # Phase 6 D4-10: dedicated stream for state snapshotting in
         # the spec loop. The clones (lin_state 75 MB + KV partial)
@@ -529,8 +629,9 @@ class Qwen36TorchFrontendRtx:
             self._mtp_static_prev_token = torch.zeros(
                 1, 1, device=device, dtype=torch.long,
             )
-            self._captured_mtp_graphs: dict[
-                int, torch.cuda.CUDAGraph] = {}
+            self._captured_mtp_graphs: collections.OrderedDict[
+                int, torch.cuda.CUDAGraph,
+            ] = collections.OrderedDict()
 
         # ---------- Phase 6 D4: S=K decode scratches ----------
         # Mirror the S=1 buffers but sized for max_q_seq=MAX_Q_SEQ so
@@ -1055,7 +1156,13 @@ class Qwen36TorchFrontendRtx:
         # capture). Per-cur_pos graph cache.
         self._static_token_id = torch.zeros(
             1, 1, device=device, dtype=torch.long)
-        self._captured_graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        # Shared mempool for every captured graph in this instance.
+        # Without this, ``torch.cuda.graph(g, stream=gs)`` defaults to
+        # a *private* mempool per graph; with N captured graphs the
+        # per-graph workspace overhead is paid N times instead of once.
+        self._graph_mempool = torch.cuda.graph_pool_handle()
+        self._captured_graphs: collections.OrderedDict[
+            int, torch.cuda.CUDAGraph] = collections.OrderedDict()
 
         # Stage-7 G1: verify-forward graph cache + static input buffers.
         # The spec loop copies token_ids / cos / sin into these pointers
@@ -1068,8 +1175,9 @@ class Qwen36TorchFrontendRtx:
             1, self.MAX_Q_SEQ, 64, device=device, dtype=bf16)
         self._verify_static_sin = torch.empty(
             1, self.MAX_Q_SEQ, 64, device=device, dtype=bf16)
-        self._captured_verify_graphs: dict[
-            tuple[int, int], torch.cuda.CUDAGraph] = {}
+        self._captured_verify_graphs: collections.OrderedDict[
+            tuple[int, int], torch.cuda.CUDAGraph,
+        ] = collections.OrderedDict()
 
         # MTP scratches (only when MTP is loaded). Mirror FP8 path's
         # MTP buffers — these are BF16/FP32 scratches and independent
@@ -1108,15 +1216,18 @@ class Qwen36TorchFrontendRtx:
                 1, 1, hidden, device=device, dtype=bf16)
             self._mtp_static_prev_token = torch.zeros(
                 1, 1, device=device, dtype=torch.long)
-            self._captured_mtp_graphs: dict[int, torch.cuda.CUDAGraph] = {}
+            self._captured_mtp_graphs: collections.OrderedDict[
+                int, torch.cuda.CUDAGraph,
+            ] = collections.OrderedDict()
             # G9: per-(base_pos, K) chain graph that captures the
             # entire K-step MTP chain (forward + argmax + inter-step
             # state copies) in one graph. Eliminates K-1 Python-level
             # replay/copy/argmax launches per spec cycle.
             self._chain_drafts_buf = torch.zeros(
                 self.MAX_Q_SEQ - 1, 1, device=device, dtype=torch.long)
-            self._captured_chain_graphs: dict[
-                tuple[int, int], torch.cuda.CUDAGraph] = {}
+            self._captured_chain_graphs: collections.OrderedDict[
+                tuple[int, int], torch.cuda.CUDAGraph,
+            ] = collections.OrderedDict()
 
         # Bundle the integer-pointer view forward consumers expect.
         self._bufs = {
@@ -2592,6 +2703,13 @@ class Qwen36TorchFrontendRtx:
             self, input_ids, *, max_new_tokens: int, K: int = 5):
         """K-generic speculative decode on the NVFP4 path.
 
+        In long-ctx mode (auto-routed when ``max_seq`` exceeds
+        ``LONG_CTX_THRESHOLD`` at construction time) this method
+        falls back to single-token decode through the TurboQuant
+        packed cache — spec decode on the TQ path is a Phase 3D
+        follow-up. The K argument is silently treated as 1; the
+        caller does not need to know which path is active.
+
         Mirror of FP8 generate_own_speculative_KN. Differences vs. FP8:
           1. Prefill is DIY: walk prompt tokens through
              forward_own_decode_nvfp4 (S=1) to populate KV cache + lin
@@ -2626,6 +2744,14 @@ class Qwen36TorchFrontendRtx:
         """
         import torch
         from flash_rt import flash_rt_kernels as fvk
+
+        # Long-ctx auto-route: TQ packed cache supports any context up
+        # to ``self._user_max_seq``, but spec decode is not yet wired
+        # on top of TQ (Phase 3D). Fall back to single-token decode —
+        # caller does not need to know the path changed.
+        if getattr(self, '_long_ctx_mode', False):
+            return self._generate_long_ctx_single_token(
+                input_ids, max_new_tokens)
 
         if self._weights.ptrs.get('mtp') is None:
             raise RuntimeError(
@@ -4390,6 +4516,69 @@ class Qwen36TorchFrontendRtx:
         sin = self._rope_sin_table[pos:pos + 1].view(1, 1, d)
         return cos, sin
 
+    # ── CUDA Graph cache LRU + shared-mempool helpers ──
+    #
+    # All ``_ensure_*_graph_*`` methods route their (key → CUDAGraph)
+    # bookkeeping through ``_graph_cache_get`` / ``_graph_cache_put``
+    # so the cache stays bounded (see ``GRAPH_CACHE_MAX``) and so that
+    # captured graphs share one mempool (``self._graph_mempool``)
+    # instead of each owning a private one. The shared mempool keeps
+    # per-graph footprint to the few buffers actually unique to that
+    # capture (cos/sin slice, FA2 partial-LSE workspace, etc.) and lets
+    # eviction reclaim that memory once the evicted graph is GC'd.
+
+    def _graph_cache_get(self, cache, key):
+        """Return the cached graph for ``key`` and mark it MRU.
+
+        Returns ``None`` on miss. Safe to call on a plain ``dict``
+        (legacy state from older pickled instances or tests that
+        bypass ``_init_graph_cache``).
+        """
+        g = cache.get(key)
+        if g is not None and isinstance(cache, collections.OrderedDict):
+            cache.move_to_end(key)
+        return g
+
+    def _graph_cache_put(self, cache, key, g) -> None:
+        """Insert ``g`` for ``key``; evict oldest if over the cap.
+
+        Eviction is a single ``popitem(last=False)`` — i.e. drop the
+        least-recently-used entry. ``GRAPH_CACHE_MAX <= 0`` disables
+        the bound (legacy unbounded behaviour).
+        """
+        cache[key] = g
+        cap = self.GRAPH_CACHE_MAX
+        if (cap > 0
+                and isinstance(cache, collections.OrderedDict)
+                and len(cache) > cap):
+            cache.popitem(last=False)
+
+    def clear_graphs(self) -> None:
+        """Drop every captured CUDA Graph (NVFP4 + FP8 + DFlash + TQ).
+
+        Public hatch for long-running servers / agents that need to
+        proactively reclaim VRAM (e.g. before instantiating a second
+        model on the same GPU, or after a phase change such as moving
+        from short-prompt chat to long-context summarisation). Cheap
+        when there is nothing cached.
+
+        After this call the next request at any ``cur_pos`` re-pays
+        the one-time graph capture cost (see ``docs/qwen36_usage.md``
+        §"Cold-start vs warm-state" for the magnitude).
+        """
+        for attr in (
+                '_captured_graphs',
+                '_captured_verify_graphs',
+                '_captured_mtp_graphs',
+                '_captured_chain_graphs',
+                '_captured_graphs_tq',
+                '_captured_verify_graphs_dflash',
+                '_captured_drafter_graphs_dflash',
+        ):
+            cache = getattr(self, attr, None)
+            if cache:
+                cache.clear()
+
     def _ensure_graph_for_pos(self, cur_pos: int):
         """Lazy-capture a CUDA Graph for forward_own_decode at cur_pos.
 
@@ -4415,26 +4604,32 @@ class Qwen36TorchFrontendRtx:
         """
         import torch
 
-        g = self._captured_graphs.get(cur_pos)
+        g = self._graph_cache_get(self._captured_graphs, cur_pos)
         if g is not None:
             return g
 
         gs = self._graph_stream
         cos, sin = self._rope_cos_sin(cur_pos)
 
-        # Snap on gs (caller is in stream(gs); clone()s issue on gs).
-        state_snap = {
-            'lin_state': self._lin_state.clone(),
-            'lin_conv_state': self._lin_conv_state.clone(),
-            'K_cache': self._attn.K_cache.clone(),
-            'V_cache': self._attn.V_cache.clone(),
-        }
+        # Partial snap: forward_own_decode only writes
+        # K_cache[full_rank, cur_pos:cur_pos+1] across the 16 full-attn
+        # layers, so cloning the (16, 1, 4, 256) slice is sufficient.
+        # Cloning the full cache used a transient ~2 GB at
+        # max_seq=32768 which OOMed long-prompt prefill on 32 GB cards.
+        self._snap_lin_buf.copy_(self._lin_state)
+        self._snap_conv_buf.copy_(self._lin_conv_state)
+        snap_K_row = self._attn.K_cache[
+            :, cur_pos:cur_pos + 1].clone()
+        snap_V_row = self._attn.V_cache[
+            :, cur_pos:cur_pos + 1].clone()
 
         def _restore_on_gs():
-            self._lin_state.copy_(state_snap['lin_state'])
-            self._lin_conv_state.copy_(state_snap['lin_conv_state'])
-            self._attn.K_cache.copy_(state_snap['K_cache'])
-            self._attn.V_cache.copy_(state_snap['V_cache'])
+            self._lin_state.copy_(self._snap_lin_buf)
+            self._lin_conv_state.copy_(self._snap_conv_buf)
+            self._attn.K_cache[
+                :, cur_pos:cur_pos + 1].copy_(snap_K_row)
+            self._attn.V_cache[
+                :, cur_pos:cur_pos + 1].copy_(snap_V_row)
 
         # Warmup (2 iters) — settles allocator / kernel-chain order.
         with torch.no_grad():
@@ -4448,7 +4643,9 @@ class Qwen36TorchFrontendRtx:
         # synchronously; we are already on gs so the ``stream=gs`` arg
         # is consistent.
         g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g, stream=gs), torch.no_grad():
+        with torch.cuda.graph(
+                g, stream=gs, pool=self._graph_mempool,
+        ), torch.no_grad():
             self.forward_own_decode(
                 self._static_token_id, cos, sin, cur_pos,
             )
@@ -4457,7 +4654,7 @@ class Qwen36TorchFrontendRtx:
         with torch.no_grad():
             _restore_on_gs()
 
-        self._captured_graphs[cur_pos] = g
+        self._graph_cache_put(self._captured_graphs, cur_pos, g)
         return g
 
     def _ensure_mtp_graph(self, mtp_pos: int):
@@ -4476,7 +4673,7 @@ class Qwen36TorchFrontendRtx:
         """
         import torch
 
-        g = self._captured_mtp_graphs.get(mtp_pos)
+        g = self._graph_cache_get(self._captured_mtp_graphs, mtp_pos)
         if g is not None:
             return g
 
@@ -4503,7 +4700,9 @@ class Qwen36TorchFrontendRtx:
 
         gs.synchronize()
         g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g, stream=gs), torch.no_grad():
+        with torch.cuda.graph(
+                g, stream=gs, pool=self._graph_mempool,
+        ), torch.no_grad():
             self.forward_mtp_head(
                 self._mtp_static_prev_h,
                 self._mtp_static_prev_token,
@@ -4514,7 +4713,7 @@ class Qwen36TorchFrontendRtx:
         gs.synchronize()
         torch.cuda.current_stream().wait_stream(gs)
 
-        self._captured_mtp_graphs[mtp_pos] = g
+        self._graph_cache_put(self._captured_mtp_graphs, mtp_pos, g)
         return g
 
     def _ensure_verify_graph(self, cur_pos: int, K: int):
@@ -4537,7 +4736,7 @@ class Qwen36TorchFrontendRtx:
         import torch
 
         key = (cur_pos, K)
-        g = self._captured_verify_graphs.get(key)
+        g = self._graph_cache_get(self._captured_verify_graphs, key)
         if g is not None:
             return g
 
@@ -4569,7 +4768,9 @@ class Qwen36TorchFrontendRtx:
 
         gs.synchronize()
         g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g, stream=gs), torch.no_grad():
+        with torch.cuda.graph(
+                g, stream=gs, pool=self._graph_mempool,
+        ), torch.no_grad():
             self.forward_own_decode_K(
                 tokens_K, cos_K, sin_K, cur_pos, K=K)
         with torch.cuda.stream(gs), torch.no_grad():
@@ -4577,7 +4778,7 @@ class Qwen36TorchFrontendRtx:
         gs.synchronize()
         torch.cuda.current_stream().wait_stream(gs)
 
-        self._captured_verify_graphs[key] = g
+        self._graph_cache_put(self._captured_verify_graphs, key, g)
         return g
 
     def generate_own(self, input_ids, *, max_new_tokens: int,
@@ -5217,31 +5418,47 @@ class Qwen36TorchFrontendRtx:
         FA2 bakes kv_seq=cur_pos+1 and cos/sin slice addresses into
         the captured kernel call list.
 
-        State integrity: snapshot lin_state / lin_conv_state / KV cache
-        pre-warmup, restore post-capture so replay starts from the
-        original pre-step state.
+        State integrity: snapshot lin_state / lin_conv_state / the
+        single KV row this step writes, restore post-capture so
+        replay starts from the original pre-step state.
+
+        Snap is *partial* — only the row at ``cur_pos`` (32 KB across
+        all 16 full-attn layers) is cloned, not the entire KV cache
+        slab. Cloning the whole cache used a transient ~2 GB at
+        ``max_seq=32768`` and was the proximate OOM in the long-prompt
+        bug report; sister methods (verify / mtp / chain / dflash)
+        already snap partially. Lin-attn state is copied into
+        pre-allocated ``_snap_lin_buf`` / ``_snap_conv_buf`` (no fresh
+        allocation per capture).
         """
         import torch
 
-        g = self._captured_graphs.get(cur_pos)
+        g = self._graph_cache_get(self._captured_graphs, cur_pos)
         if g is not None:
             return g
 
         gs = self._graph_stream
         cos, sin = self._rope_cos_sin(cur_pos)
 
-        state_snap = {
-            'lin_state': self._lin_state.clone(),
-            'lin_conv_state': self._lin_conv_state.clone(),
-            'K_cache': self._attn.K_cache.clone(),
-            'V_cache': self._attn.V_cache.clone(),
-        }
+        # Snap into pre-allocated lin buffers — zero alloc per capture.
+        self._snap_lin_buf.copy_(self._lin_state)
+        self._snap_conv_buf.copy_(self._lin_conv_state)
+        # Partial KV snap: forward_own_decode_nvfp4 only writes
+        # K_cache[full_rank, cur_pos:cur_pos+1] across the 16 full-attn
+        # layers, so the (16, 1, 4, 256) slice is the entire footprint
+        # we need to restore.
+        snap_K_row = self._attn.K_cache[
+            :, cur_pos:cur_pos + 1].clone()
+        snap_V_row = self._attn.V_cache[
+            :, cur_pos:cur_pos + 1].clone()
 
         def _restore_on_gs():
-            self._lin_state.copy_(state_snap['lin_state'])
-            self._lin_conv_state.copy_(state_snap['lin_conv_state'])
-            self._attn.K_cache.copy_(state_snap['K_cache'])
-            self._attn.V_cache.copy_(state_snap['V_cache'])
+            self._lin_state.copy_(self._snap_lin_buf)
+            self._lin_conv_state.copy_(self._snap_conv_buf)
+            self._attn.K_cache[
+                :, cur_pos:cur_pos + 1].copy_(snap_K_row)
+            self._attn.V_cache[
+                :, cur_pos:cur_pos + 1].copy_(snap_V_row)
 
         # Warmup (2 iters) to settle allocator + kernel-chain order.
         with torch.no_grad():
@@ -5252,14 +5469,16 @@ class Qwen36TorchFrontendRtx:
             _restore_on_gs()
 
         g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g, stream=gs), torch.no_grad():
+        with torch.cuda.graph(
+                g, stream=gs, pool=self._graph_mempool,
+        ), torch.no_grad():
             self.forward_own_decode_nvfp4(
                 self._static_token_id, cos, sin, cur_pos,
             )
         with torch.no_grad():
             _restore_on_gs()
 
-        self._captured_graphs[cur_pos] = g
+        self._graph_cache_put(self._captured_graphs, cur_pos, g)
         return g
 
     # ---------- Stage 7 G1: NVFP4 verify-forward graph capture ----------
@@ -5283,7 +5502,7 @@ class Qwen36TorchFrontendRtx:
         import torch
 
         key = (cur_pos, K)
-        g = self._captured_verify_graphs.get(key)
+        g = self._graph_cache_get(self._captured_verify_graphs, key)
         if g is not None:
             return g
 
@@ -5314,7 +5533,9 @@ class Qwen36TorchFrontendRtx:
 
         gs.synchronize()
         g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g, stream=gs), torch.no_grad():
+        with torch.cuda.graph(
+                g, stream=gs, pool=self._graph_mempool,
+        ), torch.no_grad():
             self.forward_own_decode_K_nvfp4(
                 tokens_K, cos_K, sin_K, cur_pos, K=K)
         with torch.cuda.stream(gs), torch.no_grad():
@@ -5322,7 +5543,7 @@ class Qwen36TorchFrontendRtx:
         gs.synchronize()
         torch.cuda.current_stream().wait_stream(gs)
 
-        self._captured_verify_graphs[key] = g
+        self._graph_cache_put(self._captured_verify_graphs, key, g)
         return g
 
     # ---------- Stage 7 G2: NVFP4 MTP chain graph capture ----------
@@ -5340,7 +5561,7 @@ class Qwen36TorchFrontendRtx:
         """
         import torch
 
-        g = self._captured_mtp_graphs.get(mtp_pos)
+        g = self._graph_cache_get(self._captured_mtp_graphs, mtp_pos)
         if g is not None:
             return g
 
@@ -5364,7 +5585,9 @@ class Qwen36TorchFrontendRtx:
 
         gs.synchronize()
         g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g, stream=gs), torch.no_grad():
+        with torch.cuda.graph(
+                g, stream=gs, pool=self._graph_mempool,
+        ), torch.no_grad():
             self.forward_mtp_head_nvfp4(
                 self._mtp_static_prev_h,
                 self._mtp_static_prev_token,
@@ -5374,7 +5597,7 @@ class Qwen36TorchFrontendRtx:
         gs.synchronize()
         torch.cuda.current_stream().wait_stream(gs)
 
-        self._captured_mtp_graphs[mtp_pos] = g
+        self._graph_cache_put(self._captured_mtp_graphs, mtp_pos, g)
         return g
 
     # ---------- G9: NVFP4 MTP CHAIN graph (K steps in one graph) ------
@@ -5404,7 +5627,7 @@ class Qwen36TorchFrontendRtx:
         import torch
 
         key = (base_pos, K)
-        g = self._captured_chain_graphs.get(key)
+        g = self._graph_cache_get(self._captured_chain_graphs, key)
         if g is not None:
             return g
 
@@ -5442,15 +5665,116 @@ class Qwen36TorchFrontendRtx:
 
         gs.synchronize()
         g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g, stream=gs), torch.no_grad():
+        with torch.cuda.graph(
+                g, stream=gs, pool=self._graph_mempool,
+        ), torch.no_grad():
             _run_chain()
         with torch.cuda.stream(gs), torch.no_grad():
             _restore()
         gs.synchronize()
         torch.cuda.current_stream().wait_stream(gs)
 
-        self._captured_chain_graphs[key] = g
+        self._graph_cache_put(self._captured_chain_graphs, key, g)
         return g
+
+    # ==================================================================
+    # Long-context auto-route (NVFP4 only)
+    # ==================================================================
+
+    def _enter_long_ctx_mode(self) -> None:
+        """Switch a freshly-initialised NVFP4 frontend onto the TQ path.
+
+        Called from ``__init__`` when ``max_seq > LONG_CTX_THRESHOLD``.
+        Buffers were sized at the threshold; this method extends KV
+        coverage out to the user-requested max_seq via the TurboQuant
+        packed cache and shrinks the now-unused BF16 KV cache to a
+        64-row dummy.
+
+        Sequence (matches the canonical pattern from the team's own
+        long-ctx benches, but without exposing the private steps to
+        callers):
+
+          1. Drop the BF16 KV cache (its rows are now stand-ins; the
+             TQ packed cache is the source of truth).
+          2. Extend the precomputed RoPE table out to the user's
+             max_seq + a small slack (the BF16 path's rope table was
+             sized at the threshold).
+          3. Allocate the TQ packed cache + BF16 single-layer staging
+             at ``max_seq_tq = user_max_seq + 16``.
+
+        After this returns, ``forward_own_decode_nvfp4_tq`` (eager) is
+        the correct decode entry. Captured-graph TQ replay is not
+        used here because its KV-cache write is skipped at capture
+        time, so replay only produces correct attention if the slot
+        was already populated for *this exact token* — fine for
+        bench (synthetic-fill, fixed token) but wrong for serving.
+        """
+        # b_v=4, b_k_total=4, bit_packed=True matches the long-ctx
+        # bench config (docs/qwen36_nvfp4.md §4): 1.83x compression
+        # at 1-byte idx → ~5x at bit-pack = the documented profile.
+        self._shrink_bf16_kv_cache(new_max_seq=64)
+        self._extend_rope_table_to(self._user_max_seq + 16)
+        self._load_turboquant_packed(
+            max_seq_tq=self._user_max_seq + 16,
+            b_v=4, b_k_total=4, bit_packed=True,
+        )
+
+    def _generate_long_ctx_single_token(
+            self, input_ids, max_new_tokens: int):
+        """Long-ctx fallback for ``generate_own_speculative_KN_nvfp4``.
+
+        Single-token decode through the eager TQ forward — supports
+        any prompt length up to ``self._user_max_seq`` and any output
+        length up to the same bound. Slower than spec (~30-40 tok/s
+        decode at 8-32 K ctx, dropping to ~20 tok/s at 256 K) but
+        works at every context length the TQ packed cache covers.
+
+        Spec decode on the TQ path is the Phase 3D follow-up; until
+        that lands, calling
+        ``generate_own_speculative_KN_nvfp4(..., K=N)`` in long-ctx
+        mode silently uses K=1 and logs a one-time info line.
+        """
+        import torch
+
+        prompt_len = int(input_ids.shape[1])
+        max_pos = prompt_len + int(max_new_tokens)
+        if max_pos > self._user_max_seq:
+            raise ValueError(
+                f'prompt_len ({prompt_len}) + max_new_tokens '
+                f'({max_new_tokens}) = {max_pos} exceeds the '
+                f'frontend max_seq ({self._user_max_seq})'
+            )
+
+        self.reset_state()
+        if not hasattr(self, '_rope_cos_table'):
+            self._build_rope_table()
+
+        generated = list(input_ids[0].tolist())
+        cur_pos = 0
+        with torch.no_grad():
+            # Prefill: one TQ forward per prompt token.
+            for p in range(prompt_len):
+                tok = input_ids[:, p:p + 1]
+                cos, sin = self._rope_cos_sin(cur_pos)
+                self.forward_own_decode_nvfp4_tq(
+                    tok, cos, sin, cur_pos)
+                cur_pos += 1
+            # First decoded token = argmax of last prefill step.
+            tok = self._logits_buf.argmax(
+                dim=-1, keepdim=True).view(1, 1)
+            generated.append(int(tok.item()))
+            # Decode loop.
+            for _ in range(int(max_new_tokens) - 1):
+                cos, sin = self._rope_cos_sin(cur_pos)
+                self.forward_own_decode_nvfp4_tq(
+                    tok, cos, sin, cur_pos)
+                tok = self._logits_buf.argmax(
+                    dim=-1, keepdim=True).view(1, 1)
+                generated.append(int(tok.item()))
+                cur_pos += 1
+
+        return torch.tensor(
+            [generated], device=input_ids.device, dtype=input_ids.dtype)
 
     # ==================================================================
     # N7-B4: TurboQuant KV cache (Phase 2B — long context to 200K+)
@@ -6085,8 +6409,10 @@ class Qwen36TorchFrontendRtx:
         import torch
 
         if not hasattr(self, '_captured_graphs_tq'):
-            self._captured_graphs_tq: dict[int, torch.cuda.CUDAGraph] = {}
-        g = self._captured_graphs_tq.get(cur_pos)
+            self._captured_graphs_tq: collections.OrderedDict[
+                int, torch.cuda.CUDAGraph,
+            ] = collections.OrderedDict()
+        g = self._graph_cache_get(self._captured_graphs_tq, cur_pos)
         if g is not None:
             return g
 
@@ -6119,14 +6445,16 @@ class Qwen36TorchFrontendRtx:
             _restore_on_gs()
 
         g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g, stream=gs), torch.no_grad():
+        with torch.cuda.graph(
+                g, stream=gs, pool=self._graph_mempool,
+        ), torch.no_grad():
             self.forward_own_decode_nvfp4_tq(
                 self._static_token_id, cos, sin, cur_pos,
             )
         with torch.no_grad():
             _restore_on_gs()
 
-        self._captured_graphs_tq[cur_pos] = g
+        self._graph_cache_put(self._captured_graphs_tq, cur_pos, g)
         return g
 
     def forward_own_decode_nvfp4_tq_captured(
@@ -6276,14 +6604,16 @@ class Qwen36TorchFrontendRtx:
         # forward. Distinct from the no-tap graph cache so we never
         # replay a tap-writing graph against a None tap_buf.
         if not hasattr(self, '_captured_verify_graphs_dflash'):
-            self._captured_verify_graphs_dflash: dict[
-                tuple[int, int], torch.cuda.CUDAGraph] = {}
+            self._captured_verify_graphs_dflash: collections.OrderedDict[
+                tuple[int, int], torch.cuda.CUDAGraph,
+            ] = collections.OrderedDict()
         # P7: per-eff_ctx drafter forward graph cache. Each eff_ctx
         # value gets its own graph because shapes (target_feat_window
         # rows, kv_seq) are baked in.
         if not hasattr(self, '_captured_drafter_graphs_dflash'):
-            self._captured_drafter_graphs_dflash: dict[
-                int, torch.cuda.CUDAGraph] = {}
+            self._captured_drafter_graphs_dflash: collections.OrderedDict[
+                int, torch.cuda.CUDAGraph,
+            ] = collections.OrderedDict()
 
     def _ensure_drafter_graph_dflash_nvfp4(self, eff_ctx: int):
         """P7: Lazy CUDA Graph capture for the entire drafter forward.
@@ -6300,7 +6630,8 @@ class Qwen36TorchFrontendRtx:
             dflash_drafter_forward_capture,
         )
 
-        g = self._captured_drafter_graphs_dflash.get(eff_ctx)
+        g = self._graph_cache_get(
+            self._captured_drafter_graphs_dflash, eff_ctx)
         if g is not None:
             return g
 
@@ -6321,14 +6652,17 @@ class Qwen36TorchFrontendRtx:
         gs.synchronize()
 
         g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g, stream=gs), torch.no_grad():
+        with torch.cuda.graph(
+                g, stream=gs, pool=self._graph_mempool,
+        ), torch.no_grad():
             dflash_drafter_forward_capture(self)
         with torch.cuda.stream(gs), torch.no_grad():
             _restore()
         gs.synchronize()
         torch.cuda.current_stream().wait_stream(gs)
 
-        self._captured_drafter_graphs_dflash[eff_ctx] = g
+        self._graph_cache_put(
+            self._captured_drafter_graphs_dflash, eff_ctx, g)
         return g
 
     def _ensure_verify_graph_dflash_nvfp4(self, cur_pos: int, K: int):
@@ -6345,7 +6679,8 @@ class Qwen36TorchFrontendRtx:
         import torch
 
         key = (cur_pos, K)
-        g = self._captured_verify_graphs_dflash.get(key)
+        g = self._graph_cache_get(
+            self._captured_verify_graphs_dflash, key)
         if g is not None:
             return g
 
@@ -6378,7 +6713,9 @@ class Qwen36TorchFrontendRtx:
 
         gs.synchronize()
         g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g, stream=gs), torch.no_grad():
+        with torch.cuda.graph(
+                g, stream=gs, pool=self._graph_mempool,
+        ), torch.no_grad():
             self.forward_own_decode_K_nvfp4(
                 tokens_K, cos_K, sin_K, cur_pos, K=K,
                 tap_buf=tap_buf)
@@ -6387,7 +6724,8 @@ class Qwen36TorchFrontendRtx:
         gs.synchronize()
         torch.cuda.current_stream().wait_stream(gs)
 
-        self._captured_verify_graphs_dflash[key] = g
+        self._graph_cache_put(
+            self._captured_verify_graphs_dflash, key, g)
         return g
 
     def generate_own_speculative_DFlash_nvfp4(
