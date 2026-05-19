@@ -1,0 +1,167 @@
+/* WeChat 公众号 / 知乎友好 inline CSS
+ * 注意：WeChat 编辑器会保留 inline computed style，但会去掉 class、id、外链 stylesheet。
+ * 所以一切样式必须能被浏览器渲染成 inline，复制到编辑器才能保形。
+ */
+
+body {
+    font-family: -apple-system, "PingFang SC", "Helvetica Neue", "Microsoft YaHei", sans-serif;
+    font-size: 16px;
+    line-height: 1.75;
+    color: #333;
+    max-width: 720px;
+    margin: 30px auto;
+    padding: 0 20px;
+    background: #fff;
+}
+
+h1 {
+    font-size: 24px;
+    font-weight: 700;
+    color: #1a1a1a;
+    margin-top: 30px;
+    margin-bottom: 20px;
+    padding-bottom: 10px;
+    border-bottom: 2px solid #e0e0e0;
+    line-height: 1.4;
+}
+
+h2 {
+    font-size: 20px;
+    font-weight: 700;
+    color: #1a1a1a;
+    margin-top: 36px;
+    margin-bottom: 16px;
+    padding-left: 10px;
+    border-left: 4px solid #1f6feb;
+    line-height: 1.4;
+}
+
+h3 {
+    font-size: 17px;
+    font-weight: 700;
+    color: #1a1a1a;
+    margin-top: 24px;
+    margin-bottom: 12px;
+    line-height: 1.5;
+}
+
+h4 {
+    font-size: 16px;
+    font-weight: 700;
+    color: #444;
+    margin-top: 20px;
+    margin-bottom: 10px;
+}
+
+p {
+    margin: 14px 0;
+    text-align: justify;
+}
+
+a {
+    color: #1f6feb;
+    text-decoration: none;
+    border-bottom: 1px solid #d0e3ff;
+}
+
+a:hover {
+    border-bottom-color: #1f6feb;
+}
+
+strong {
+    color: #d62728;
+    font-weight: 700;
+}
+
+em {
+    color: #555;
+}
+
+code {
+    background: #f4f5f7;
+    color: #c7254e;
+    padding: 2px 6px;
+    border-radius: 3px;
+    font-family: "SF Mono", Menlo, Consolas, monospace;
+    font-size: 14px;
+}
+
+pre {
+    background: #1e2127;
+    color: #abb2bf;
+    padding: 16px;
+    border-radius: 6px;
+    overflow-x: auto;
+    font-family: "SF Mono", Menlo, Consolas, monospace;
+    font-size: 13px;
+    line-height: 1.5;
+    margin: 16px 0;
+}
+
+pre code {
+    background: transparent;
+    color: inherit;
+    padding: 0;
+    font-size: 13px;
+}
+
+blockquote {
+    margin: 16px 0;
+    padding: 12px 16px;
+    background: #f8f9fa;
+    border-left: 4px solid #95a5a6;
+    color: #555;
+    font-size: 15px;
+}
+
+blockquote p {
+    margin: 6px 0;
+}
+
+ul, ol {
+    margin: 14px 0;
+    padding-left: 26px;
+}
+
+li {
+    margin: 6px 0;
+}
+
+table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 18px 0;
+    font-size: 14px;
+}
+
+th, td {
+    border: 1px solid #d0d7de;
+    padding: 8px 12px;
+    text-align: left;
+    vertical-align: top;
+}
+
+th {
+    background: #f4f5f7;
+    font-weight: 700;
+    color: #1a1a1a;
+}
+
+tr:nth-child(even) td {
+    background: #fafbfc;
+}
+
+img {
+    max-width: 100%;
+    height: auto;
+    display: block;
+    margin: 20px auto;
+    border-radius: 4px;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+}
+
+hr {
+    border: none;
+    border-top: 1px solid #e0e0e0;
+    margin: 30px 0;
+}
