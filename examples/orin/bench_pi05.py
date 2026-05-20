@@ -63,6 +63,9 @@ def parse_args():
                    help="Enable INT8 fast path (sets FVK_PI05_RTX_FORCE_INT8=1, default ON)")
     p.add_argument("--no-int8", dest="int8", action="store_false",
                    help="Run BF16 reference path instead of INT8 fast path")
+    p.add_argument("--frontend", choices=["torch", "jax"], default="torch",
+                   help="Frontend / checkpoint format: torch (HF safetensors) "
+                        "or jax (Orbax). Default: torch.")
     return p.parse_args()
 
 
@@ -91,10 +94,13 @@ def main():
     repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     sys.path.insert(0, repo)
 
-    from flash_rt.frontends.torch.pi05_rtx import Pi05TorchFrontendRtx
+    if args.frontend == "jax":
+        from flash_rt.frontends.jax.pi05_rtx import Pi05JaxFrontendRtx as Pi05Frontend
+    else:
+        from flash_rt.frontends.torch.pi05_rtx import Pi05TorchFrontendRtx as Pi05Frontend
 
-    print(f"\nLoading checkpoint: {args.checkpoint}")
-    pipe = Pi05TorchFrontendRtx(
+    print(f"\nLoading checkpoint ({args.frontend}): {args.checkpoint}")
+    pipe = Pi05Frontend(
         args.checkpoint,
         num_views=args.num_views,
         num_steps=args.steps,
