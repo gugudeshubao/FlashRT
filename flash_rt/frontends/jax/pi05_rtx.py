@@ -490,13 +490,27 @@ class Pi05JaxFrontendRtx(Pi05TorchFrontendRtx):
         # default to None (= standard non-CFG inference).
         self._rl_config: Optional[dict] = None
         self._rl_current_prompt_text: Optional[str] = None
-        self._force_int8_decoder = False
-        self._use_int8_encoder = False
-        self._int8_encoder_only = False
-        self._use_int8_vision = False
+        # INT8 routing — env-var driven, mirrors flash_rt.frontends.torch.pi05_rtx.
+        # FVK_PI05_RTX_FORCE_INT8=1: encoder + decoder INT8 W8A8 rowwise (Orin SM87 fast path).
+        # FVK_PI05_RTX_INT8_ENCODER_ONLY=1: encoder INT8, decoder stays BF16
+        # (M=10 → INT8 CUTLASS tile waste makes it slower than cuBLASLt BF16 at small M).
+        # FVK_PI05_RTX_INT8_VISION=1: opt-in dynamic per-row INT8 for SigLIP GEMMs;
+        # static per-tensor INT8 was measured to break encoder cosine and is disabled.
+        self._force_int8_decoder = os.environ.get(
+            "FVK_PI05_RTX_FORCE_INT8", "0") == "1"
+        _enc_only = os.environ.get("FVK_PI05_RTX_INT8_ENCODER_ONLY", "0") == "1"
+        if _enc_only:
+            self._force_int8_decoder = False
+        self._use_int8_encoder = self._force_int8_decoder or _enc_only
+        self._int8_encoder_only = _enc_only
+        self._use_int8_vision = (
+            os.environ.get("FVK_PI05_RTX_INT8_VISION", "0") == "1")
         self._use_int8_vision_static = False
         env_force_bf16 = os.environ.get("FVK_PI05_RTX_FORCE_BF16", "0") == "1"
-        self._force_bf16 = env_force_bf16 or not supports_fp8()
+        self._force_bf16 = (
+            (env_force_bf16 or not supports_fp8()) and
+            not self._force_int8_decoder
+        )
 
         # ── norm_stats (same locations as torch frontend) ──
         self._load_norm_stats(checkpoint_dir)
@@ -526,14 +540,22 @@ class Pi05JaxFrontendRtx(Pi05TorchFrontendRtx):
             self._ckpt_bf16["decoder_action_out_proj_b"] * (-1.0 / self._num_steps)
         )
 
-        # ── FP8 quantize large GEMM weights (shared method) ──
+        # ── Low-precision weight stores (shared methods on Pi05TorchFrontendRtx) ──
         self._fp8_weights: dict = {}
         self._fp8_store: list = []
         self._int8_weights: dict = {}
         self._int8_store: list = []
         self._int8_weight_scales: dict[str, torch.Tensor] = {}
-        if self.use_fp8 and not self._force_bf16:
+        if self.use_fp8 and not self._force_bf16 and not self._force_int8_decoder:
             self._quantize_all_fp8()
+        if self._force_int8_decoder:
+            self._quantize_decoder_int8()
+        if self._use_int8_encoder:
+            self._quantize_encoder_int8()
+        if self._use_int8_vision:
+            self._quantize_vision_int8()
+        if self._use_int8_vision_static:
+            self._quantize_vision_int8()
 
         # ── Pre-compute decoder styles (shared helper) ──
         from flash_rt.frontends.torch.pi05_rtx import _precompute_decoder_styles
